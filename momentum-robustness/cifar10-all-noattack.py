@@ -83,6 +83,12 @@ parser.add_argument(
     choices=["aggregate", "mean"],
     help="What target the EMA center should track.",
 )
+parser.add_argument(
+    "--center-scale",
+    type=float,
+    default=1.0,
+    help="Scalar multiplier applied to the center before measuring distances and clipping.",
+)
 parser.add_argument("--wandb", action="store_true", default=False)
 parser.add_argument(
     "--wandb-project",
@@ -123,6 +129,7 @@ LOG_DIR = (
         f"{args.attack}_{args.agg}_tau{args.clip_tau}_m{args.momentum}"
         f"_mom{args.momentum_mode}"
         f"_center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
+        f"-scale{args.center_scale}"
         f"_local{args.local_steps}"
         f"_seed{args.seed}"
     )
@@ -154,6 +161,7 @@ def _get_aggregator():
             center_update=args.center_update,
             center_momentum=args.center_momentum,
             center_source=args.center_source,
+            center_scale=args.center_scale,
         )
 
     raise NotImplementedError(args.agg)
@@ -199,6 +207,7 @@ def maybe_init_wandb():
             f"noattack-{args.agg}-tau{args.clip_tau}-m{args.momentum}"
             f"-mom{args.momentum_mode}"
             f"-center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
+            f"-scale{args.center_scale}"
             f"-local{args.local_steps}"
             f"-seed{args.seed}"
         )
@@ -218,6 +227,7 @@ def maybe_init_wandb():
             "center_update": args.center_update,
             "center_momentum": args.center_momentum,
             "center_source": args.center_source,
+            "center_scale": args.center_scale,
             "seed": args.seed,
             "n_workers": N_WORKERS,
             "batch_size": BATCH_SIZE,
@@ -256,6 +266,7 @@ def make_wandb_post_batch_hook():
                 "centered_to_raw_norm_ratio"
             ],
             "train/center_norm": diagnostics["center_norm"],
+            "train/scaled_center_norm": diagnostics["scaled_center_norm"],
             "train/next_center_norm": diagnostics["next_center_norm"],
             "train/mean_update_norm": diagnostics["mean_update_norm"],
             "train/aggregate_norm": diagnostics["aggregate_norm"],

@@ -16,12 +16,14 @@ class Clipping(_BaseAggregator):
         center_update="current",
         center_momentum=0.9,
         center_source="aggregate",
+        center_scale=1.0,
     ):
         self.tau = tau
         self.n_iter = n_iter
         self.center_update = center_update
         self.center_momentum = center_momentum
         self.center_source = center_source
+        self.center_scale = center_scale
         super(Clipping, self).__init__()
         self.momentum = None
         self.latest_diagnostics = {}
@@ -36,21 +38,23 @@ class Clipping(_BaseAggregator):
             self.momentum = torch.zeros_like(inputs[0])
 
         center_before = torch.clone(self.momentum).detach()
+        scaled_center_before = self.center_scale * center_before
         raw_norms = torch.tensor(
             [torch.norm(v).item() for v in inputs],
             device=inputs[0].device,
         )
         centered_norms = torch.tensor(
-            [torch.norm(v - center_before).item() for v in inputs],
+            [torch.norm(v - scaled_center_before).item() for v in inputs],
             device=inputs[0].device,
         )
         mean_update = torch.stack(inputs, dim=0).mean(dim=0)
         mean_update_norm = torch.norm(mean_update).item()
         center_norm = torch.norm(center_before).item()
-        center_eps = center_before.norm().clamp_min(1e-12)
+        scaled_center_norm = torch.norm(scaled_center_before).item()
+        center_eps = scaled_center_before.norm().clamp_min(1e-12)
         cosines = torch.tensor(
             [
-                torch.dot(v, center_before).item()
+                torch.dot(v, scaled_center_before).item()
                 / (torch.norm(v).clamp_min(1e-12).item() * center_eps.item())
                 for v in inputs
             ],
@@ -60,12 +64,16 @@ class Clipping(_BaseAggregator):
         clip_fractions = []
         refined_center = torch.clone(self.momentum).detach()
         for _ in range(self.n_iter):
+            scaled_refined_center = self.center_scale * refined_center
             clip_fractions.append(
-                sum(float(torch.norm(v - refined_center) > self.tau) for v in inputs)
+                sum(
+                    float(torch.norm(v - scaled_refined_center) > self.tau)
+                    for v in inputs
+                )
                 / len(inputs)
             )
             refined_center = (
-                sum(self.clip(v - refined_center) for v in inputs) / len(inputs)
+                sum(self.clip(v - scaled_refined_center) for v in inputs) / len(inputs)
                 + refined_center
             )
 
@@ -83,6 +91,7 @@ class Clipping(_BaseAggregator):
 
         self.latest_diagnostics = {
             "center_norm": center_norm,
+            "scaled_center_norm": scaled_center_norm,
             "raw_grad_norm_mean": raw_norms.mean().item(),
             "raw_grad_norm_max": raw_norms.max().item(),
             "centered_grad_distance_mean": centered_norms.mean().item(),
@@ -103,13 +112,14 @@ class Clipping(_BaseAggregator):
 
     def __str__(self):
         return (
-            "Clipping (tau={}, n_iter={}, center_update={}, center_momentum={}, center_source={})"
+            "Clipping (tau={}, n_iter={}, center_update={}, center_momentum={}, center_source={}, center_scale={})"
         ).format(
             self.tau,
             self.n_iter,
             self.center_update,
             self.center_momentum,
             self.center_source,
+            self.center_scale,
         )
 
 
