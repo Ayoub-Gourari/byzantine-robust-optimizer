@@ -42,6 +42,13 @@ parser.add_argument("--attack", type=str, default="NA", help="Select from BF and
 parser.add_argument("--agg", type=str, default="cp", help="Aggregator.")
 parser.add_argument("--momentum", type=float, default=0, help="momentum")
 parser.add_argument(
+    "--momentum-mode",
+    type=str,
+    default="ema",
+    choices=["classic", "ema"],
+    help="Use original momentum accumulation or normalized EMA worker momentum.",
+)
+parser.add_argument(
     "--local-steps",
     type=int,
     default=1,
@@ -114,6 +121,7 @@ LOG_DIR = (
     + ("debug/" if args.debug else "")
     + (
         f"{args.attack}_{args.agg}_tau{args.clip_tau}_m{args.momentum}"
+        f"_mom{args.momentum_mode}"
         f"_center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
         f"_local{args.local_steps}"
         f"_seed{args.seed}"
@@ -166,6 +174,7 @@ def initialize_worker(
     )
     return WorkerWithMomentum(
         momentum=MOMENTUM,
+        momentum_mode=args.momentum_mode,
         local_steps=args.local_steps,
         data_loader=train_loader,
         model=model,
@@ -188,6 +197,7 @@ def maybe_init_wandb():
     run_name = args.wandb_run_name or (
         (
             f"noattack-{args.agg}-tau{args.clip_tau}-m{args.momentum}"
+            f"-mom{args.momentum_mode}"
             f"-center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
             f"-local{args.local_steps}"
             f"-seed{args.seed}"
@@ -203,6 +213,7 @@ def maybe_init_wandb():
             "clip_tau": args.clip_tau,
             "inner_iterations": args.inner_iterations,
             "momentum": args.momentum,
+            "momentum_mode": args.momentum_mode,
             "local_steps": args.local_steps,
             "center_update": args.center_update,
             "center_momentum": args.center_momentum,

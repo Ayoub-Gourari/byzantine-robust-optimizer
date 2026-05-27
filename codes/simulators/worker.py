@@ -135,9 +135,12 @@ class WorkerWithMomentum(TorchWorker):
     because we need to explicitly update the `momentum_buffer`.
     """
 
-    def __init__(self, momentum, *args, **kwargs):
+    def __init__(self, momentum, momentum_mode="classic", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.momentum = momentum
+        if momentum_mode not in ["classic", "ema"]:
+            raise ValueError(f"Unknown momentum_mode: {momentum_mode}.")
+        self.momentum_mode = momentum_mode
 
     def _save_grad(self) -> None:
         for group in self.optimizer.param_groups:
@@ -148,7 +151,13 @@ class WorkerWithMomentum(TorchWorker):
                 if "momentum_buffer" not in param_state:
                     param_state["momentum_buffer"] = torch.clone(p.grad).detach()
                 else:
-                    param_state["momentum_buffer"].mul_(self.momentum).add_(p.grad)
+                    param_state["momentum_buffer"].mul_(self.momentum)
+                    if self.momentum_mode == "classic":
+                        param_state["momentum_buffer"].add_(p.grad)
+                    else:
+                        param_state["momentum_buffer"].add_(
+                            p.grad, alpha=1 - self.momentum
+                        )
 
     def _get_saved_grad(self) -> torch.Tensor:
         layer_gradients = []
