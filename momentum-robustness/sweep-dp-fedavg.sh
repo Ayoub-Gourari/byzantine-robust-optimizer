@@ -8,7 +8,7 @@ cd "$ROOT_DIR"
 TAUS=("0.1" "1.0" "10.0")
 LRS=("0.05" "0.1" "0.01")
 SEEDS=("0")
-TARGET_EPSILON="10"
+NOISE_MULTIPLIER="0.1"
 TARGET_DELTA="2e-5"
 
 USE_CUDA_FLAG="${USE_CUDA_FLAG:---use-cuda}"
@@ -27,7 +27,7 @@ for seed in "${SEEDS[@]}"; do
         --model resnet20 \
         --agg dp-fedavg \
         --clip-tau "$tau" \
-        --target-epsilon "$TARGET_EPSILON" \
+        --dp-noise-multiplier "$NOISE_MULTIPLIER" \
         --target-delta "$TARGET_DELTA" \
         --lr "$lr" \
         --momentum 0.9 \
