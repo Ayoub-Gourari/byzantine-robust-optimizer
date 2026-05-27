@@ -95,6 +95,12 @@ parser.add_argument(
     default=1.0,
     help="Scalar multiplier applied to the center before measuring distances and clipping.",
 )
+parser.add_argument(
+    "--per-client-center-momentum",
+    type=float,
+    default=0.9,
+    help="EMA coefficient for per-client historical centers used in diagnostics.",
+)
 parser.add_argument("--wandb", action="store_true", default=False)
 parser.add_argument(
     "--wandb-project",
@@ -237,6 +243,7 @@ def maybe_init_wandb():
             "center_momentum": args.center_momentum,
             "center_source": args.center_source,
             "center_scale": args.center_scale,
+            "per_client_center_momentum": args.per_client_center_momentum,
             "seed": args.seed,
             "n_workers": N_WORKERS,
             "batch_size": BATCH_SIZE,
@@ -250,42 +257,183 @@ def maybe_init_wandb():
     return run
 
 
+class PerClientHistoryDiagnostics:
+    def __init__(self, center_momentum):
+        self.center_momentum = center_momentum
+        self.prev_updates = None
+        self.ema_centers = None
+        self.latest_diagnostics = {}
+
+    def update(self, updates):
+        if not updates:
+            self.latest_diagnostics = {}
+            return self.latest_diagnostics
+
+        raw_norms = torch.tensor(
+            [torch.norm(update).item() for update in updates],
+            device=updates[0].device,
+        )
+        raw_norm_mean = raw_norms.mean().clamp_min(1e-12)
+
+        if self.prev_updates is None:
+            prev_centers = [torch.zeros_like(update) for update in updates]
+        else:
+            prev_centers = self.prev_updates
+
+        if self.ema_centers is None:
+            ema_centers = [torch.zeros_like(update) for update in updates]
+        else:
+            ema_centers = self.ema_centers
+
+        prev_residual_norms = torch.tensor(
+            [torch.norm(update - center).item() for update, center in zip(updates, prev_centers)],
+            device=updates[0].device,
+        )
+        ema_residual_norms = torch.tensor(
+            [torch.norm(update - center).item() for update, center in zip(updates, ema_centers)],
+            device=updates[0].device,
+        )
+        prev_cosines = torch.tensor(
+            [
+                torch.dot(update, center).item()
+                / (
+                    torch.norm(update).clamp_min(1e-12).item()
+                    * torch.norm(center).clamp_min(1e-12).item()
+                )
+                for update, center in zip(updates, prev_centers)
+            ],
+            device=updates[0].device,
+        )
+        ema_cosines = torch.tensor(
+            [
+                torch.dot(update, center).item()
+                / (
+                    torch.norm(update).clamp_min(1e-12).item()
+                    * torch.norm(center).clamp_min(1e-12).item()
+                )
+                for update, center in zip(updates, ema_centers)
+            ],
+            device=updates[0].device,
+        )
+
+        self.latest_diagnostics = {
+            "per_client_prev_centered_grad_distance_mean": prev_residual_norms.mean().item(),
+            "per_client_prev_centered_to_raw_norm_ratio": (
+                prev_residual_norms.mean() / raw_norm_mean
+            ).item(),
+            "per_client_prev_mean_cosine_with_center": prev_cosines.mean().item(),
+            "per_client_prev_min_cosine_with_center": prev_cosines.min().item(),
+            "per_client_ema_centered_grad_distance_mean": ema_residual_norms.mean().item(),
+            "per_client_ema_centered_to_raw_norm_ratio": (
+                ema_residual_norms.mean() / raw_norm_mean
+            ).item(),
+            "per_client_ema_mean_cosine_with_center": ema_cosines.mean().item(),
+            "per_client_ema_min_cosine_with_center": ema_cosines.min().item(),
+            "per_client_prev_center_norm_mean": torch.tensor(
+                [torch.norm(center).item() for center in prev_centers],
+                device=updates[0].device,
+            ).mean().item(),
+            "per_client_ema_center_norm_mean": torch.tensor(
+                [torch.norm(center).item() for center in ema_centers],
+                device=updates[0].device,
+            ).mean().item(),
+        }
+
+        if self.ema_centers is None:
+            self.ema_centers = [update.detach().clone() for update in updates]
+        else:
+            self.ema_centers = [
+                self.center_momentum * center
+                + (1 - self.center_momentum) * update.detach()
+                for center, update in zip(self.ema_centers, updates)
+            ]
+        self.prev_updates = [update.detach().clone() for update in updates]
+        return self.latest_diagnostics
+
+
 def make_wandb_post_batch_hook():
     def hook(trainer, epoch, batch_idx):
         if wandb is None or wandb.run is None:
             return
 
         diagnostics = getattr(trainer.aggregator, "latest_diagnostics", None)
-        if not diagnostics:
+        history_tracker = getattr(trainer, "per_client_history_tracker", None)
+        per_client_diagnostics = {}
+        if history_tracker is not None:
+            per_client_diagnostics = history_tracker.update(
+                getattr(trainer, "latest_worker_gradients", None)
+            )
+
+        if not diagnostics and not per_client_diagnostics:
             return
 
         payload = {
             "train/epoch": epoch,
             "train/batch_idx": batch_idx,
             "train/global_step": trainer.global_step,
-            "train/raw_grad_norm_mean": diagnostics["raw_grad_norm_mean"],
-            "train/centered_grad_distance_mean": diagnostics[
-                "centered_grad_distance_mean"
-            ],
-            "train/raw_grad_norm_max": diagnostics["raw_grad_norm_max"],
-            "train/centered_grad_distance_max": diagnostics[
-                "centered_grad_distance_max"
-            ],
-            "train/centered_to_raw_norm_ratio": diagnostics[
-                "centered_to_raw_norm_ratio"
-            ],
-            "train/center_norm": diagnostics["center_norm"],
-            "train/scaled_center_norm": diagnostics["scaled_center_norm"],
-            "train/next_center_norm": diagnostics["next_center_norm"],
-            "train/mean_update_norm": diagnostics["mean_update_norm"],
-            "train/aggregate_norm": diagnostics["aggregate_norm"],
-            "train/mean_cosine_with_center": diagnostics["mean_cosine_with_center"],
-            "train/min_cosine_with_center": diagnostics["min_cosine_with_center"],
-            "train/center_to_mean_update_norm_ratio": diagnostics[
-                "center_to_mean_update_norm_ratio"
-            ],
-            "train/clip_fraction_mean": diagnostics["clip_fraction_mean"],
         }
+        if diagnostics:
+            payload.update(
+                {
+                    "train/raw_grad_norm_mean": diagnostics["raw_grad_norm_mean"],
+                    "train/centered_grad_distance_mean": diagnostics[
+                        "centered_grad_distance_mean"
+                    ],
+                    "train/raw_grad_norm_max": diagnostics["raw_grad_norm_max"],
+                    "train/centered_grad_distance_max": diagnostics[
+                        "centered_grad_distance_max"
+                    ],
+                    "train/centered_to_raw_norm_ratio": diagnostics[
+                        "centered_to_raw_norm_ratio"
+                    ],
+                    "train/center_norm": diagnostics["center_norm"],
+                    "train/scaled_center_norm": diagnostics["scaled_center_norm"],
+                    "train/next_center_norm": diagnostics["next_center_norm"],
+                    "train/mean_update_norm": diagnostics["mean_update_norm"],
+                    "train/aggregate_norm": diagnostics["aggregate_norm"],
+                    "train/mean_cosine_with_center": diagnostics["mean_cosine_with_center"],
+                    "train/min_cosine_with_center": diagnostics["min_cosine_with_center"],
+                    "train/center_to_mean_update_norm_ratio": diagnostics[
+                        "center_to_mean_update_norm_ratio"
+                    ],
+                    "train/clip_fraction_mean": diagnostics["clip_fraction_mean"],
+                }
+            )
+        if per_client_diagnostics:
+            payload.update(
+                {
+                    "train/per_client_prev_centered_grad_distance_mean": per_client_diagnostics[
+                        "per_client_prev_centered_grad_distance_mean"
+                    ],
+                    "train/per_client_prev_centered_to_raw_norm_ratio": per_client_diagnostics[
+                        "per_client_prev_centered_to_raw_norm_ratio"
+                    ],
+                    "train/per_client_prev_mean_cosine_with_center": per_client_diagnostics[
+                        "per_client_prev_mean_cosine_with_center"
+                    ],
+                    "train/per_client_prev_min_cosine_with_center": per_client_diagnostics[
+                        "per_client_prev_min_cosine_with_center"
+                    ],
+                    "train/per_client_prev_center_norm_mean": per_client_diagnostics[
+                        "per_client_prev_center_norm_mean"
+                    ],
+                    "train/per_client_ema_centered_grad_distance_mean": per_client_diagnostics[
+                        "per_client_ema_centered_grad_distance_mean"
+                    ],
+                    "train/per_client_ema_centered_to_raw_norm_ratio": per_client_diagnostics[
+                        "per_client_ema_centered_to_raw_norm_ratio"
+                    ],
+                    "train/per_client_ema_mean_cosine_with_center": per_client_diagnostics[
+                        "per_client_ema_mean_cosine_with_center"
+                    ],
+                    "train/per_client_ema_min_cosine_with_center": per_client_diagnostics[
+                        "per_client_ema_min_cosine_with_center"
+                    ],
+                    "train/per_client_ema_center_norm_mean": per_client_diagnostics[
+                        "per_client_ema_center_norm_mean"
+                    ],
+                }
+            )
         wandb.log(payload, step=trainer.global_step)
 
     return hook
@@ -327,6 +475,9 @@ def main(args):
         metrics=metrics,
         use_cuda=args.use_cuda,
         debug=False,
+    )
+    trainer.per_client_history_tracker = PerClientHistoryDiagnostics(
+        center_momentum=args.per_client_center_momentum
     )
 
     test_loader = cifar10(

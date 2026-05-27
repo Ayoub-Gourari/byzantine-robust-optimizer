@@ -138,6 +138,7 @@ class ParallelTrainer(DistributedTrainerBase):
         self.post_batch_hooks = post_batch_hooks or []
         self.global_step = 0
         self.latest_train_log = None
+        self.latest_worker_gradients = None
         super().__init__(max_batches_per_epoch, log_interval, metrics, use_cuda, debug)
 
     def __str__(self):
@@ -172,6 +173,7 @@ class ParallelTrainer(DistributedTrainerBase):
             omniscient_attacker_callback()
 
         gradients = self.parallel_get(lambda w: w.get_gradient())
+        self.latest_worker_gradients = [g.detach().clone() for g in gradients]
 
         aggregated = self.aggregator(gradients)
 
