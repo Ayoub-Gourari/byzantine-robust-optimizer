@@ -190,6 +190,8 @@ class ResidualTrackingWorker(TorchWorker):
             )
         self.residual_center_mode = residual_center_mode
         self.private_center = None
+        self.raw_prev_update_center = None
+        self.raw_ema_center = None
         self.latest_diagnostics = {}
 
     def _clip(self, v):
@@ -219,12 +221,33 @@ class ResidualTrackingWorker(TorchWorker):
         raw_update_norm = torch.norm(raw_update).item()
         center_norm = torch.norm(center_before).item()
 
+        if self.raw_prev_update_center is None:
+            raw_prev_center = torch.zeros_like(raw_update)
+        else:
+            raw_prev_center = self.raw_prev_update_center
+
+        if self.raw_ema_center is None:
+            raw_ema_center = torch.zeros_like(raw_update)
+        else:
+            raw_ema_center = self.raw_ema_center
+
+        raw_prev_residual_norm = torch.norm(raw_update - raw_prev_center).item()
+        raw_ema_residual_norm = torch.norm(raw_update - raw_ema_center).item()
+
         if self.residual_center_mode == "ema":
             self.private_center = (
                 center_before + self.residual_alpha * clipped_residual.detach()
             )
         else:
             self.private_center = raw_update.detach().clone()
+        if self.raw_ema_center is None:
+            self.raw_ema_center = raw_update.detach().clone()
+        else:
+            self.raw_ema_center = (
+                (1 - self.residual_alpha) * raw_ema_center
+                + self.residual_alpha * raw_update.detach()
+            )
+        self.raw_prev_update_center = raw_update.detach().clone()
         self.state["residual_tracking"]["saved_residual"] = clipped_residual.detach()
         self.latest_diagnostics = {
             "raw_update_norm": raw_update_norm,
@@ -233,6 +256,10 @@ class ResidualTrackingWorker(TorchWorker):
             "residual_norm": residual_norm,
             "clipped_residual_norm": clipped_residual_norm,
             "residual_to_raw_norm_ratio": residual_norm / max(raw_update_norm, 1e-12),
+            "raw_prev_residual_to_raw_norm_ratio": raw_prev_residual_norm
+            / max(raw_update_norm, 1e-12),
+            "raw_ema_residual_to_raw_norm_ratio": raw_ema_residual_norm
+            / max(raw_update_norm, 1e-12),
             "clip_fraction": float(residual_norm > self.residual_clip_tau),
         }
 
