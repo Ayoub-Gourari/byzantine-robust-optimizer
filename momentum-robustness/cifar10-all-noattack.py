@@ -50,6 +50,26 @@ parser.add_argument(
 parser.add_argument(
     "--inner-iterations", type=int, default=1, help="[HP]: number of inner iterations."
 )
+parser.add_argument(
+    "--center-update",
+    type=str,
+    default="current",
+    choices=["current", "ema"],
+    help="How to update the center used by centered clipping.",
+)
+parser.add_argument(
+    "--center-momentum",
+    type=float,
+    default=0.9,
+    help="EMA coefficient when using --center-update ema.",
+)
+parser.add_argument(
+    "--center-source",
+    type=str,
+    default="aggregate",
+    choices=["aggregate", "mean"],
+    help="What target the EMA center should track.",
+)
 parser.add_argument("--wandb", action="store_true", default=False)
 parser.add_argument(
     "--wandb-project",
@@ -86,7 +106,11 @@ MOMENTUM = args.momentum
 LOG_DIR = (
     EXP_DIR
     + ("debug/" if args.debug else "")
-    + f"{args.attack}_{args.agg}_tau{args.clip_tau}_m{args.momentum}_seed{args.seed}"
+    + (
+        f"{args.attack}_{args.agg}_tau{args.clip_tau}_m{args.momentum}"
+        f"_center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
+        f"_seed{args.seed}"
+    )
 )
 
 assert args.attack == "NA"
@@ -109,7 +133,13 @@ def _get_aggregator():
         return Mean()
 
     if args.agg == "cp":
-        return Clipping(tau=args.clip_tau, n_iter=args.inner_iterations)
+        return Clipping(
+            tau=args.clip_tau,
+            n_iter=args.inner_iterations,
+            center_update=args.center_update,
+            center_momentum=args.center_momentum,
+            center_source=args.center_source,
+        )
 
     raise NotImplementedError(args.agg)
 
@@ -148,7 +178,11 @@ def maybe_init_wandb():
         )
 
     run_name = args.wandb_run_name or (
-        f"noattack-{args.agg}-tau{args.clip_tau}-m{args.momentum}-seed{args.seed}"
+        (
+            f"noattack-{args.agg}-tau{args.clip_tau}-m{args.momentum}"
+            f"-center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
+            f"-seed{args.seed}"
+        )
     )
     run = wandb.init(
         project=args.wandb_project,
@@ -160,6 +194,9 @@ def maybe_init_wandb():
             "clip_tau": args.clip_tau,
             "inner_iterations": args.inner_iterations,
             "momentum": args.momentum,
+            "center_update": args.center_update,
+            "center_momentum": args.center_momentum,
+            "center_source": args.center_source,
             "seed": args.seed,
             "n_workers": N_WORKERS,
             "batch_size": BATCH_SIZE,
@@ -198,6 +235,14 @@ def make_wandb_post_batch_hook():
                 "centered_to_raw_norm_ratio"
             ],
             "train/center_norm": diagnostics["center_norm"],
+            "train/next_center_norm": diagnostics["next_center_norm"],
+            "train/mean_update_norm": diagnostics["mean_update_norm"],
+            "train/aggregate_norm": diagnostics["aggregate_norm"],
+            "train/mean_cosine_with_center": diagnostics["mean_cosine_with_center"],
+            "train/min_cosine_with_center": diagnostics["min_cosine_with_center"],
+            "train/center_to_mean_update_norm_ratio": diagnostics[
+                "center_to_mean_update_norm_ratio"
+            ],
             "train/clip_fraction_mean": diagnostics["clip_fraction_mean"],
         }
         wandb.log(payload, step=trainer.global_step)

@@ -9,9 +9,19 @@ debug_logger = logging.getLogger("debug")
 
 
 class Clipping(_BaseAggregator):
-    def __init__(self, tau, n_iter=1):
+    def __init__(
+        self,
+        tau,
+        n_iter=1,
+        center_update="current",
+        center_momentum=0.9,
+        center_source="aggregate",
+    ):
         self.tau = tau
         self.n_iter = n_iter
+        self.center_update = center_update
+        self.center_momentum = center_momentum
+        self.center_source = center_source
         super(Clipping, self).__init__()
         self.momentum = None
         self.latest_diagnostics = {}
@@ -26,25 +36,53 @@ class Clipping(_BaseAggregator):
             self.momentum = torch.zeros_like(inputs[0])
 
         center_before = torch.clone(self.momentum).detach()
-        raw_norms = torch.tensor([torch.norm(v).item() for v in inputs], device=inputs[0].device)
+        raw_norms = torch.tensor(
+            [torch.norm(v).item() for v in inputs],
+            device=inputs[0].device,
+        )
         centered_norms = torch.tensor(
             [torch.norm(v - center_before).item() for v in inputs],
             device=inputs[0].device,
         )
+        mean_update = torch.stack(inputs, dim=0).mean(dim=0)
+        mean_update_norm = torch.norm(mean_update).item()
+        center_norm = torch.norm(center_before).item()
+        center_eps = center_before.norm().clamp_min(1e-12)
+        cosines = torch.tensor(
+            [
+                torch.dot(v, center_before).item()
+                / (torch.norm(v).clamp_min(1e-12).item() * center_eps.item())
+                for v in inputs
+            ],
+            device=inputs[0].device,
+        )
 
         clip_fractions = []
+        refined_center = torch.clone(self.momentum).detach()
         for _ in range(self.n_iter):
             clip_fractions.append(
-                sum(float(torch.norm(v - self.momentum) > self.tau) for v in inputs)
+                sum(float(torch.norm(v - refined_center) > self.tau) for v in inputs)
                 / len(inputs)
             )
-            self.momentum = (
-                sum(self.clip(v - self.momentum) for v in inputs) / len(inputs)
-                + self.momentum
+            refined_center = (
+                sum(self.clip(v - refined_center) for v in inputs) / len(inputs)
+                + refined_center
             )
 
+        aggregate = torch.clone(refined_center).detach()
+        if self.center_update == "current":
+            self.momentum = aggregate
+        elif self.center_update == "ema":
+            center_target = aggregate if self.center_source == "aggregate" else mean_update
+            self.momentum = (
+                self.center_momentum * center_before
+                + (1 - self.center_momentum) * center_target
+            )
+        else:
+            raise NotImplementedError(self.center_update)
+
         self.latest_diagnostics = {
-            "center_norm": torch.norm(center_before).item(),
+            "center_norm": center_norm,
             "raw_grad_norm_mean": raw_norms.mean().item(),
             "raw_grad_norm_max": raw_norms.max().item(),
             "centered_grad_distance_mean": centered_norms.mean().item(),
@@ -52,15 +90,27 @@ class Clipping(_BaseAggregator):
             "centered_to_raw_norm_ratio": (
                 centered_norms.mean() / raw_norms.mean().clamp_min(1e-12)
             ).item(),
+            "mean_update_norm": mean_update_norm,
+            "aggregate_norm": torch.norm(aggregate).item(),
+            "next_center_norm": torch.norm(self.momentum).item(),
+            "mean_cosine_with_center": cosines.mean().item(),
+            "min_cosine_with_center": cosines.min().item(),
+            "center_to_mean_update_norm_ratio": center_norm / max(mean_update_norm, 1e-12),
             "clip_fraction_mean": sum(clip_fractions) / len(clip_fractions),
         }
 
-        # print(self.momentum[:5])
-        # raise NotImplementedError
-        return torch.clone(self.momentum).detach()
+        return aggregate.detach()
 
     def __str__(self):
-        return "Clipping (tau={}, n_iter={})".format(self.tau, self.n_iter)
+        return (
+            "Clipping (tau={}, n_iter={}, center_update={}, center_momentum={}, center_source={})"
+        ).format(
+            self.tau,
+            self.n_iter,
+            self.center_update,
+            self.center_momentum,
+            self.center_source,
+        )
 
 
 class AnchorClipping(Clipping):
