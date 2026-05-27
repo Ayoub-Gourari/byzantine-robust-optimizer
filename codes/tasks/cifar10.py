@@ -8,7 +8,7 @@ from .resnet_gn import get_resnet_model_gn
 from ..utils import log_dict
 
 
-def get_resnet(model="resnet8", use_cuda=False, gn=False):
+def get_resnet(model="resnet20", use_cuda=False, gn=False):
     if gn:
         print("Using group normalization")
         return get_resnet_model_gn(

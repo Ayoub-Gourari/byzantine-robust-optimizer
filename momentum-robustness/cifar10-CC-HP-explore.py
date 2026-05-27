@@ -155,7 +155,7 @@ def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    model = get_resnet(model="resnet8", use_cuda=args.use_cuda, gn=False).to(device)
+    model = get_resnet(model="resnet20", use_cuda=args.use_cuda, gn=False).to(device)
     # NOTE: no momentum
     optimizer = torch.optim.SGD(model.parameters(), lr=0)
     loss_func = CrossEntropyLoss().to(device)

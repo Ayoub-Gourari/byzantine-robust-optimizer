@@ -43,7 +43,7 @@ parser.add_argument("--agg", type=str, default="cp", help="Aggregator.")
 parser.add_argument(
     "--model",
     type=str,
-    default="resnet8",
+    default="resnet20",
     help="CIFAR ResNet model to use.",
 )
 parser.add_argument("--momentum", type=float, default=0, help="momentum")
