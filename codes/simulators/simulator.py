@@ -136,6 +136,8 @@ class ParallelTrainer(DistributedTrainerBase):
         self.server = server
         self.pre_batch_hooks = pre_batch_hooks or []
         self.post_batch_hooks = post_batch_hooks or []
+        self.global_step = 0
+        self.latest_train_log = None
         super().__init__(max_batches_per_epoch, log_interval, metrics, use_cuda, debug)
 
     def __str__(self):
@@ -187,6 +189,7 @@ class ParallelTrainer(DistributedTrainerBase):
                 self._run_pre_batch_hooks(epoch, batch_idx)
                 results = self.parallel_get(lambda w: w.compute_gradient())
                 self.aggregation_and_update()
+                self.global_step += 1
 
                 progress += sum(res["length"] for res in results)
                 if batch_idx % self.log_interval == 0:
@@ -228,6 +231,7 @@ class ParallelTrainer(DistributedTrainerBase):
 
         # Output to file
         self.json_logger.info(r)
+        self.latest_train_log = r
 
 
 class DistributedEvaluator(DistributedSimulatorBase):
@@ -246,6 +250,7 @@ class DistributedEvaluator(DistributedSimulatorBase):
         self.data_loader = data_loader
         self.loss_func = loss_func
         self.device = device
+        self.latest_eval_log = None
 
     def __str__(self):
         return (
@@ -282,8 +287,10 @@ class DistributedEvaluator(DistributedSimulatorBase):
 
         # Output to file
         self.json_logger.info(r)
+        self.latest_eval_log = r
         self.debug_logger.info(
             f"\n=> Eval Loss={r['Loss']:.4f} "
             + " ".join(name + "=" + "{:>8.4f}".format(r[name]) for name in self.metrics)
             + "\n"
         )
+        return r

@@ -12,25 +12,18 @@ from codes.simulators.simulator import (
     ParallelTrainer,
     DistributedEvaluator,
 )
-from codes.simulators.worker import WorkerWithMomentum, ByzantineWorker
+from codes.simulators.worker import WorkerWithMomentum
 from codes.simulators.server import TorchServer
 
-
-# from codes.tasks.mnist import mnist, Net
 from codes.tasks.cifar10 import cifar10, get_resnet20
 from codes.utils import top1_accuracy, initialize_logger
-from codes.attacks.labelflipping import LableFlippingWorker
-from codes.attacks.bitflipping import BitFlippingWorker
-
-from codes.attacks.xie import IPMAttack
-from codes.attacks.alittle import ALittleIsEnoughAttack
-
-from codes.aggregator.coordinatewise_median import CM
 from codes.aggregator.clipping import Clipping
-from codes.aggregator.rfa import RFA
-from codes.aggregator.trimmed_mean import TM
-from codes.aggregator.krum import Krum
 from codes.aggregator.base import Mean
+
+try:
+    import wandb
+except ImportError:  # pragma: no cover - handled at runtime when wandb logging is requested
+    wandb = None
 
 
 EXP_ID = __file__[:-3]
@@ -46,10 +39,35 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--log_interval", type=int, default=10)
 
 parser.add_argument("--attack", type=str, default="NA", help="Select from BF and LF.")
-parser.add_argument("--agg", type=str, help="Aggregator.")
+parser.add_argument("--agg", type=str, default="cp", help="Aggregator.")
 parser.add_argument("--momentum", type=float, default=0, help="momentum")
 parser.add_argument(
+    "--clip-tau",
+    type=float,
+    default=100.0,
+    help="Centered clipping radius for the no-attack experiment.",
+)
+parser.add_argument(
     "--inner-iterations", type=int, default=1, help="[HP]: number of inner iterations."
+)
+parser.add_argument("--wandb", action="store_true", default=False)
+parser.add_argument(
+    "--wandb-project",
+    type=str,
+    default="Federated_Centered_Clipping",
+    help="W&B project name.",
+)
+parser.add_argument(
+    "--wandb-entity",
+    type=str,
+    default="ae-gourari-cole-polytechnique",
+    help="W&B entity name.",
+)
+parser.add_argument(
+    "--wandb-run-name",
+    type=str,
+    default=None,
+    help="Optional W&B run name.",
 )
 
 args = parser.parse_args()
@@ -68,11 +86,10 @@ MOMENTUM = args.momentum
 LOG_DIR = (
     EXP_DIR
     + ("debug/" if args.debug else "")
-    + f"{args.attack}_{args.agg}_m{args.momentum}_seed{args.seed}"
+    + f"{args.attack}_{args.agg}_tau{args.clip_tau}_m{args.momentum}_seed{args.seed}"
 )
 
 assert args.attack == "NA"
-assert args.agg == "avg"
 
 
 def get_sampler_callback(rank):
@@ -91,11 +108,14 @@ def _get_aggregator():
     if args.agg == "avg":
         return Mean()
 
+    if args.agg == "cp":
+        return Clipping(tau=args.clip_tau, n_iter=args.inner_iterations)
+
     raise NotImplementedError(args.agg)
 
 
 def initialize_worker(
-    trainer, worker_rank, model, optimizer, loss_func, device, kwargs
+    worker_rank, model, optimizer, loss_func, device, kwargs
 ):
     train_loader = cifar10(
         data_dir=DATA_DIR,
@@ -107,56 +127,6 @@ def initialize_worker(
         drop_last=True,  # Exclude the influence of non-full batch.
         **kwargs,
     )
-    # NOTE: The first N_BYZ nodes are Byzantine
-    if worker_rank < N_BYZ:
-        if args.attack == "BF":
-            return BitFlippingWorker(
-                data_loader=train_loader,
-                model=model,
-                loss_func=loss_func,
-                device=device,
-                optimizer=optimizer,
-                **kwargs,
-            )
-
-        if args.attack == "LF":
-            return LableFlippingWorker(
-                revertible_label_transformer=lambda target: 9 - target,
-                data_loader=train_loader,
-                model=model,
-                loss_func=loss_func,
-                device=device,
-                optimizer=optimizer,
-                **kwargs,
-            )
-
-        if args.attack == "IPM":
-            attacker = IPMAttack(
-                epsilon=0.1,
-                data_loader=train_loader,
-                model=model,
-                loss_func=loss_func,
-                device=device,
-                optimizer=optimizer,
-                **kwargs,
-            )
-            attacker.configure(trainer)
-            return attacker
-
-        if args.attack == "ALIE":
-            attacker = ALittleIsEnoughAttack(
-                n=N_WORKERS,
-                m=N_BYZ,
-                data_loader=train_loader,
-                model=model,
-                loss_func=loss_func,
-                device=device,
-                optimizer=optimizer,
-                **kwargs,
-            )
-            attacker.configure(trainer)
-            return attacker
-        raise NotImplementedError(f"No such attack {args.attack}")
     return WorkerWithMomentum(
         momentum=MOMENTUM,
         data_loader=train_loader,
@@ -168,8 +138,76 @@ def initialize_worker(
     )
 
 
+def maybe_init_wandb():
+    if not args.wandb:
+        return None
+
+    if wandb is None:
+        raise ImportError(
+            "wandb is not installed. Install it with `pip install wandb` before using --wandb."
+        )
+
+    run_name = args.wandb_run_name or (
+        f"noattack-{args.agg}-tau{args.clip_tau}-m{args.momentum}-seed{args.seed}"
+    )
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=run_name,
+        config={
+            "attack": args.attack,
+            "agg": args.agg,
+            "clip_tau": args.clip_tau,
+            "inner_iterations": args.inner_iterations,
+            "momentum": args.momentum,
+            "seed": args.seed,
+            "n_workers": N_WORKERS,
+            "batch_size": BATCH_SIZE,
+            "epochs": EPOCHS,
+            "lr": LR,
+        },
+    )
+    wandb.define_metric("train/global_step")
+    wandb.define_metric("train/*", step_metric="train/global_step")
+    wandb.define_metric("validation/*", step_metric="train/global_step")
+    return run
+
+
+def make_wandb_post_batch_hook():
+    def hook(trainer, epoch, batch_idx):
+        if wandb is None or wandb.run is None:
+            return
+
+        diagnostics = getattr(trainer.aggregator, "latest_diagnostics", None)
+        if not diagnostics:
+            return
+
+        payload = {
+            "train/epoch": epoch,
+            "train/batch_idx": batch_idx,
+            "train/global_step": trainer.global_step,
+            "train/raw_grad_norm_mean": diagnostics["raw_grad_norm_mean"],
+            "train/centered_grad_distance_mean": diagnostics[
+                "centered_grad_distance_mean"
+            ],
+            "train/raw_grad_norm_max": diagnostics["raw_grad_norm_max"],
+            "train/centered_grad_distance_max": diagnostics[
+                "centered_grad_distance_max"
+            ],
+            "train/centered_to_raw_norm_ratio": diagnostics[
+                "centered_to_raw_norm_ratio"
+            ],
+            "train/center_norm": diagnostics["center_norm"],
+            "train/clip_fraction_mean": diagnostics["clip_fraction_mean"],
+        }
+        wandb.log(payload, step=trainer.global_step)
+
+    return hook
+
+
 def main(args):
     initialize_logger(LOG_DIR)
+    run = maybe_init_wandb()
 
     if args.use_cuda and not torch.cuda.is_available():
         print("=> There is no cuda device!!!!")
@@ -192,11 +230,12 @@ def main(args):
     server_opt = torch.optim.SGD(model.parameters(), lr=LR)
     server = TorchServer(server_opt)
 
+    post_batch_hooks = [make_wandb_post_batch_hook()] if args.wandb else []
     trainer = ParallelTrainer(
         server=server,
         aggregator=_get_aggregator(),
         pre_batch_hooks=[],
-        post_batch_hooks=[],
+        post_batch_hooks=post_batch_hooks,
         max_batches_per_epoch=MAX_BATCHES_PER_EPOCH,
         log_interval=args.log_interval,
         metrics=metrics,
@@ -229,7 +268,6 @@ def main(args):
 
     for worker_rank in range(N_WORKERS):
         worker = initialize_worker(
-            trainer=trainer,
             worker_rank=worker_rank,
             model=model,
             optimizer=optimizer,
@@ -241,10 +279,24 @@ def main(args):
 
     for epoch in range(1, EPOCHS + 1):
         trainer.train(epoch)
-        evaluator.evaluate(epoch)
+        eval_log = evaluator.evaluate(epoch)
         trainer.parallel_call(lambda w: w.data_loader.sampler.set_epoch(epoch))
         scheduler.step()
+        if args.wandb:
+            wandb.log(
+                {
+                    "validation/epoch": epoch,
+                    "validation/loss": eval_log["Loss"],
+                    "validation/top1": eval_log["top1"],
+                    "validation/global_step": trainer.global_step,
+                    "train/lr": scheduler.get_last_lr()[0],
+                },
+                step=trainer.global_step,
+            )
         print(f"E={epoch}; Learning rate = {scheduler.get_lr()[0]:}")
+
+    if run is not None:
+        run.finish()
 
 
 if __name__ == "__main__":

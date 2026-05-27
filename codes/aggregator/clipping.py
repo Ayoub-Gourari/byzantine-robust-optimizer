@@ -14,6 +14,7 @@ class Clipping(_BaseAggregator):
         self.n_iter = n_iter
         super(Clipping, self).__init__()
         self.momentum = None
+        self.latest_diagnostics = {}
 
     def clip(self, v):
         v_norm = torch.norm(v)
@@ -24,11 +25,35 @@ class Clipping(_BaseAggregator):
         if self.momentum is None:
             self.momentum = torch.zeros_like(inputs[0])
 
+        center_before = torch.clone(self.momentum).detach()
+        raw_norms = torch.tensor([torch.norm(v).item() for v in inputs], device=inputs[0].device)
+        centered_norms = torch.tensor(
+            [torch.norm(v - center_before).item() for v in inputs],
+            device=inputs[0].device,
+        )
+
+        clip_fractions = []
         for _ in range(self.n_iter):
+            clip_fractions.append(
+                sum(float(torch.norm(v - self.momentum) > self.tau) for v in inputs)
+                / len(inputs)
+            )
             self.momentum = (
                 sum(self.clip(v - self.momentum) for v in inputs) / len(inputs)
                 + self.momentum
             )
+
+        self.latest_diagnostics = {
+            "center_norm": torch.norm(center_before).item(),
+            "raw_grad_norm_mean": raw_norms.mean().item(),
+            "raw_grad_norm_max": raw_norms.max().item(),
+            "centered_grad_distance_mean": centered_norms.mean().item(),
+            "centered_grad_distance_max": centered_norms.max().item(),
+            "centered_to_raw_norm_ratio": (
+                centered_norms.mean() / raw_norms.mean().clamp_min(1e-12)
+            ).item(),
+            "clip_fraction_mean": sum(clip_fractions) / len(clip_fractions),
+        }
 
         # print(self.momentum[:5])
         # raise NotImplementedError
