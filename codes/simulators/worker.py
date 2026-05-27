@@ -173,11 +173,23 @@ class WorkerWithMomentum(TorchWorker):
 class ResidualTrackingWorker(TorchWorker):
     """Client-side residual tracker for private residual-tracking FedAvg."""
 
-    def __init__(self, residual_clip_tau, residual_alpha, *args, **kwargs):
+    def __init__(
+        self,
+        residual_clip_tau,
+        residual_alpha,
+        residual_center_mode="ema",
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.residual_clip_tau = residual_clip_tau
         self.residual_alpha = residual_alpha
-        self.private_tracker = None
+        if residual_center_mode not in ["ema", "buffer"]:
+            raise ValueError(
+                f"Unknown residual_center_mode: {residual_center_mode}."
+            )
+        self.residual_center_mode = residual_center_mode
+        self.private_center = None
         self.latest_diagnostics = {}
 
     def _clip(self, v):
@@ -196,22 +208,28 @@ class ResidualTrackingWorker(TorchWorker):
 
     def _save_grad(self) -> None:
         raw_update = self._flatten_current_gradient()
-        if self.private_tracker is None:
-            self.private_tracker = torch.zeros_like(raw_update)
+        if self.private_center is None:
+            self.private_center = torch.zeros_like(raw_update)
 
-        residual = raw_update - self.private_tracker
+        center_before = self.private_center
+        residual = raw_update - center_before
         clipped_residual = self._clip(residual)
         clipped_residual_norm = torch.norm(clipped_residual).item()
         residual_norm = torch.norm(residual).item()
         raw_update_norm = torch.norm(raw_update).item()
+        center_norm = torch.norm(center_before).item()
 
-        self.private_tracker = (
-            self.private_tracker + self.residual_alpha * clipped_residual.detach()
-        )
+        if self.residual_center_mode == "ema":
+            self.private_center = (
+                center_before + self.residual_alpha * clipped_residual.detach()
+            )
+        else:
+            self.private_center = raw_update.detach().clone()
         self.state["residual_tracking"]["saved_residual"] = clipped_residual.detach()
         self.latest_diagnostics = {
             "raw_update_norm": raw_update_norm,
-            "private_tracker_norm": torch.norm(self.private_tracker).item(),
+            "private_center_norm": center_norm,
+            "next_private_center_norm": torch.norm(self.private_center).item(),
             "residual_norm": residual_norm,
             "clipped_residual_norm": clipped_residual_norm,
             "residual_to_raw_norm_ratio": residual_norm / max(raw_update_norm, 1e-12),

@@ -115,6 +115,13 @@ parser.add_argument(
     help="Client tracker step size for --agg dp-residual.",
 )
 parser.add_argument(
+    "--residual-center-mode",
+    type=str,
+    default="ema",
+    choices=["ema", "buffer"],
+    help="Client-side center update for --agg dp-residual.",
+)
+parser.add_argument(
     "--dp-noise-multiplier",
     type=float,
     default=0.0,
@@ -179,7 +186,7 @@ LOG_DIR = (
         f"_lr{args.lr}"
         f"_center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
         f"-scale{args.center_scale}"
-        f"_alpha{args.residual_alpha}"
+        f"_rcenter{args.residual_center_mode}-alpha{args.residual_alpha}"
         f"_{DP_NOISE_LABEL}"
         f"_local{args.local_steps}"
         f"_seed{args.seed}"
@@ -258,6 +265,7 @@ def initialize_worker(
         return ResidualTrackingWorker(
             residual_clip_tau=args.clip_tau,
             residual_alpha=args.residual_alpha,
+            residual_center_mode=args.residual_center_mode,
             **worker_kwargs,
         )
 
@@ -285,7 +293,7 @@ def maybe_init_wandb():
             f"-lr{args.lr}"
             f"-center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
             f"-scale{args.center_scale}"
-            f"-alpha{args.residual_alpha}"
+            f"-rcenter{args.residual_center_mode}-alpha{args.residual_alpha}"
             f"-{DP_NOISE_LABEL}"
             f"-local{args.local_steps}"
             f"-seed{args.seed}"
@@ -311,6 +319,7 @@ def maybe_init_wandb():
             "center_scale": args.center_scale,
             "per_client_center_momentum": args.per_client_center_momentum,
             "residual_alpha": args.residual_alpha,
+            "residual_center_mode": args.residual_center_mode,
             "dp_noise_multiplier": args.dp_noise_multiplier,
             "requested_dp_noise_multiplier": args.dp_noise_multiplier,
             "target_epsilon": args.target_epsilon,
