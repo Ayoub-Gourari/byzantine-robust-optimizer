@@ -42,6 +42,12 @@ parser.add_argument("--attack", type=str, default="NA", help="Select from BF and
 parser.add_argument("--agg", type=str, default="cp", help="Aggregator.")
 parser.add_argument("--momentum", type=float, default=0, help="momentum")
 parser.add_argument(
+    "--local-steps",
+    type=int,
+    default=1,
+    help="Number of local minibatch gradients to average per worker before aggregation.",
+)
+parser.add_argument(
     "--clip-tau",
     type=float,
     default=100.0,
@@ -109,6 +115,7 @@ LOG_DIR = (
     + (
         f"{args.attack}_{args.agg}_tau{args.clip_tau}_m{args.momentum}"
         f"_center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
+        f"_local{args.local_steps}"
         f"_seed{args.seed}"
     )
 )
@@ -159,6 +166,7 @@ def initialize_worker(
     )
     return WorkerWithMomentum(
         momentum=MOMENTUM,
+        local_steps=args.local_steps,
         data_loader=train_loader,
         model=model,
         loss_func=loss_func,
@@ -181,6 +189,7 @@ def maybe_init_wandb():
         (
             f"noattack-{args.agg}-tau{args.clip_tau}-m{args.momentum}"
             f"-center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
+            f"-local{args.local_steps}"
             f"-seed{args.seed}"
         )
     )
@@ -194,6 +203,7 @@ def maybe_init_wandb():
             "clip_tau": args.clip_tau,
             "inner_iterations": args.inner_iterations,
             "momentum": args.momentum,
+            "local_steps": args.local_steps,
             "center_update": args.center_update,
             "center_momentum": args.center_momentum,
             "center_source": args.center_source,

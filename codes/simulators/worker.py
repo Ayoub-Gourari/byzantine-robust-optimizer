@@ -21,12 +21,16 @@ class TorchWorker(object):
         optimizer: torch.optim.Optimizer,
         loss_func: torch.nn.modules.loss._Loss,
         device: Union[torch.device, str],
+        local_steps: int = 1,
     ):
         self.data_loader = data_loader
         self.model = model
         self.optimizer = optimizer
         self.loss_func = loss_func
         self.device = device
+        if local_steps < 1:
+            raise ValueError(f"local_steps must be >= 1. Got {local_steps}.")
+        self.local_steps = local_steps
 
         self.running = {}
         self.metrics = {}
@@ -52,24 +56,46 @@ class TorchWorker(object):
         self.model.train()
 
     def compute_gradient(self) -> Tuple[float, int]:
-        results = {}
+        results = {"loss": 0, "length": 0, "metrics": defaultdict(float)}
+        accumulated_grads = defaultdict(lambda: None)
 
-        data, target = self.running["train_loader_iterator"].__next__()
-        data, target = data.to(self.device), target.to(self.device)
+        for _ in range(self.local_steps):
+            data, target = self.running["train_loader_iterator"].__next__()
+            data, target = data.to(self.device), target.to(self.device)
+            self.optimizer.zero_grad()
+            output = self.model(data)
+            loss = self.loss_func(output, target)
+            loss.backward()
+
+            batch_length = len(target)
+            results["loss"] += loss.item() * batch_length
+            results["length"] += batch_length
+            for name, metric in self.metrics.items():
+                results["metrics"][name] += metric(output, target) * batch_length
+
+            for group in self.optimizer.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    if accumulated_grads[p] is None:
+                        accumulated_grads[p] = torch.clone(p.grad).detach()
+                    else:
+                        accumulated_grads[p].add_(p.grad)
+
         self.optimizer.zero_grad()
-        output = self.model(data)
-        loss = self.loss_func(output, target)
-        loss.backward()
+        for group in self.optimizer.param_groups:
+            for p in group["params"]:
+                if accumulated_grads[p] is None:
+                    continue
+                p.grad = accumulated_grads[p].div(self.local_steps)
         self._save_grad()
 
         self.running["data"] = data
         self.running["target"] = target
 
-        results["loss"] = loss.item()
-        results["length"] = len(target)
-        results["metrics"] = {}
         for name, metric in self.metrics.items():
-            results["metrics"][name] = metric(output, target)
+            results["metrics"][name] /= results["length"]
+        results["loss"] /= results["length"]
         return results
 
     def get_gradient(self) -> torch.Tensor:
