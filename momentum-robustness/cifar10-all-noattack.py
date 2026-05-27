@@ -537,6 +537,21 @@ def make_wandb_post_batch_hook():
     return hook
 
 
+def log_wandb_validation(eval_log, epoch, global_step):
+    if wandb is None or wandb.run is None:
+        return
+
+    wandb.log(
+        {
+            "validation/epoch": epoch,
+            "validation/loss": eval_log["Loss"],
+            "validation/top1": eval_log["top1"],
+            "validation/global_step": global_step,
+        },
+        step=global_step,
+    )
+
+
 def main(args):
     initialize_logger(LOG_DIR)
     run = maybe_init_wandb()
@@ -664,22 +679,18 @@ def main(args):
             allow_val_change=True,
         )
 
+    initial_eval_log = evaluator.evaluate(0)
+    if args.wandb:
+        log_wandb_validation(initial_eval_log, epoch=0, global_step=trainer.global_step)
+
     for epoch in range(1, EPOCHS + 1):
         trainer.train(epoch)
         eval_log = evaluator.evaluate(epoch)
         trainer.parallel_call(lambda w: w.data_loader.sampler.set_epoch(epoch))
         scheduler.step()
         if args.wandb:
-            wandb.log(
-                {
-                    "validation/epoch": epoch,
-                    "validation/loss": eval_log["Loss"],
-                    "validation/top1": eval_log["top1"],
-                    "validation/global_step": trainer.global_step,
-                    "train/lr": scheduler.get_last_lr()[0],
-                },
-                step=trainer.global_step,
-            )
+            log_wandb_validation(eval_log, epoch=epoch, global_step=trainer.global_step)
+            wandb.log({"train/lr": scheduler.get_last_lr()[0]}, step=trainer.global_step)
         print(f"E={epoch}; Learning rate = {scheduler.get_lr()[0]:}")
 
     if run is not None:

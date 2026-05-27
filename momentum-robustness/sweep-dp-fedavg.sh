@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-TAUS=("1.0" "5.0" "10.0")
+TAUS=("0.5" "1.0" "5.0")
 LRS=("0.05" "0.1" "0.01")
 SEEDS=("0")
 NOISE_MULTIPLIER="0.1"
