@@ -8,17 +8,21 @@ from .resnet_gn import get_resnet_model_gn
 from ..utils import log_dict
 
 
-def get_resnet20(use_cuda=False, gn=False):
+def get_resnet(model="resnet8", use_cuda=False, gn=False):
     if gn:
         print("Using group normalization")
         return get_resnet_model_gn(
-            model="resnet20", version=1, dtype="fp32", num_classes=10, use_cuda=use_cuda
+            model=model, version=1, dtype="fp32", num_classes=10, use_cuda=use_cuda
         )
 
     print("Using Batch normalization")
     return get_resnet_model(
-        model="resnet20", version=1, dtype="fp32", num_classes=10, use_cuda=use_cuda
+        model=model, version=1, dtype="fp32", num_classes=10, use_cuda=use_cuda
     )
+
+
+def get_resnet20(use_cuda=False, gn=False):
+    return get_resnet(model="resnet20", use_cuda=use_cuda, gn=gn)
 
 
 def cifar10(

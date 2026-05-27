@@ -15,7 +15,7 @@ from codes.simulators.simulator import (
 from codes.simulators.worker import WorkerWithMomentum
 from codes.simulators.server import TorchServer
 
-from codes.tasks.cifar10 import cifar10, get_resnet20
+from codes.tasks.cifar10 import cifar10, get_resnet
 from codes.utils import top1_accuracy, initialize_logger
 from codes.aggregator.clipping import Clipping
 from codes.aggregator.base import Mean
@@ -40,6 +40,12 @@ parser.add_argument("--log_interval", type=int, default=10)
 
 parser.add_argument("--attack", type=str, default="NA", help="Select from BF and LF.")
 parser.add_argument("--agg", type=str, default="cp", help="Aggregator.")
+parser.add_argument(
+    "--model",
+    type=str,
+    default="resnet8",
+    help="CIFAR ResNet model to use.",
+)
 parser.add_argument("--momentum", type=float, default=0, help="momentum")
 parser.add_argument(
     "--momentum-mode",
@@ -128,6 +134,7 @@ LOG_DIR = (
     + (
         f"{args.attack}_{args.agg}_tau{args.clip_tau}_m{args.momentum}"
         f"_mom{args.momentum_mode}"
+        f"_model{args.model}"
         f"_center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
         f"-scale{args.center_scale}"
         f"_local{args.local_steps}"
@@ -206,6 +213,7 @@ def maybe_init_wandb():
         (
             f"noattack-{args.agg}-tau{args.clip_tau}-m{args.momentum}"
             f"-mom{args.momentum_mode}"
+            f"-model{args.model}"
             f"-center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
             f"-scale{args.center_scale}"
             f"-local{args.local_steps}"
@@ -219,6 +227,7 @@ def maybe_init_wandb():
         config={
             "attack": args.attack,
             "agg": args.agg,
+            "model": args.model,
             "clip_tau": args.clip_tau,
             "inner_iterations": args.inner_iterations,
             "momentum": args.momentum,
@@ -297,7 +306,7 @@ def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    model = get_resnet20(use_cuda=args.use_cuda, gn=False).to(device)
+    model = get_resnet(model=args.model, use_cuda=args.use_cuda, gn=False).to(device)
     # NOTE: no momentum
     optimizer = torch.optim.SGD(model.parameters(), lr=LR)
     loss_func = CrossEntropyLoss().to(device)

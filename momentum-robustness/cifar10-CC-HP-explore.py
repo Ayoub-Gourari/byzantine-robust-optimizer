@@ -41,7 +41,7 @@ from codes.simulators.server import TorchServer
 
 
 # from codes.tasks.mnist import mnist, Net
-from codes.tasks.cifar10 import cifar10, get_resnet20
+from codes.tasks.cifar10 import cifar10, get_resnet
 from codes.utils import top1_accuracy, initialize_logger
 from codes.attacks.labelflipping import LableFlippingWorker
 from codes.attacks.bitflipping import BitFlippingWorker
@@ -155,7 +155,7 @@ def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    model = get_resnet20(use_cuda=args.use_cuda, gn=False).to(device)
+    model = get_resnet(model="resnet8", use_cuda=args.use_cuda, gn=False).to(device)
     # NOTE: no momentum
     optimizer = torch.optim.SGD(model.parameters(), lr=0)
     loss_func = CrossEntropyLoss().to(device)

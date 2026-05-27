@@ -401,7 +401,7 @@ def get_resnet_model_gn(model, version, dtype, num_classes=1000, use_cuda=False)
     """
     if model == "resnet18":
         model = resnet18_bkj(num_classes)
-    elif model in ["resnet20", "resnet32", "resnet44", "resnet56", "resnet110"]:
+    elif model in ["resnet8", "resnet20", "resnet32", "resnet44", "resnet56", "resnet110"]:
         resnet_size = int(model[len("resnet") :])
         model = ResNetCIFAR(resnet_size, False, 10, version=version)
     else:
