@@ -12,13 +12,14 @@ from codes.simulators.simulator import (
     ParallelTrainer,
     DistributedEvaluator,
 )
-from codes.simulators.worker import WorkerWithMomentum
+from codes.simulators.worker import ResidualTrackingWorker, WorkerWithMomentum
 from codes.simulators.server import TorchServer
 
 from codes.tasks.cifar10 import cifar10, get_resnet
 from codes.utils import top1_accuracy, initialize_logger
 from codes.aggregator.clipping import Clipping
 from codes.aggregator.base import Mean
+from codes.aggregator.dp_residual import CentralDPFedAvg, CentralDPResidualTracking
 
 try:
     import wandb
@@ -37,9 +38,15 @@ parser.add_argument("--use-cuda", action="store_true", default=False)
 parser.add_argument("--debug", action="store_true", default=False)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--log_interval", type=int, default=10)
+parser.add_argument("--lr", type=float, default=0.1, help="Server/client learning rate.")
 
 parser.add_argument("--attack", type=str, default="NA", help="Select from BF and LF.")
-parser.add_argument("--agg", type=str, default="cp", help="Aggregator.")
+parser.add_argument(
+    "--agg",
+    type=str,
+    default="cp",
+    help="Aggregator. Use dp-residual or dp-fedavg for central-DP baselines.",
+)
 parser.add_argument(
     "--model",
     type=str,
@@ -101,6 +108,30 @@ parser.add_argument(
     default=0.9,
     help="EMA coefficient for per-client historical centers used in diagnostics.",
 )
+parser.add_argument(
+    "--residual-alpha",
+    type=float,
+    default=1.0,
+    help="Client tracker step size for --agg dp-residual.",
+)
+parser.add_argument(
+    "--dp-noise-multiplier",
+    type=float,
+    default=0.0,
+    help="Central Gaussian noise multiplier for --agg dp-fedavg and --agg dp-residual with add/remove adjacency.",
+)
+parser.add_argument(
+    "--target-epsilon",
+    type=float,
+    default=None,
+    help="Target epsilon for the full-participation central-DP accountant.",
+)
+parser.add_argument(
+    "--target-delta",
+    type=float,
+    default=1e-5,
+    help="Target delta for the full-participation central-DP accountant.",
+)
 parser.add_argument("--wandb", action="store_true", default=False)
 parser.add_argument(
     "--wandb-project",
@@ -130,8 +161,12 @@ BATCH_SIZE = 32
 TEST_BATCH_SIZE = 128
 MAX_BATCHES_PER_EPOCH = 9999999
 EPOCHS = 100
-LR = 0.1
 MOMENTUM = args.momentum
+DP_NOISE_LABEL = (
+    f"eps{args.target_epsilon}-delta{args.target_delta}"
+    if args.target_epsilon is not None
+    else f"sigma{args.dp_noise_multiplier}"
+)
 
 # LOG_DIR = EXP_DIR + "log"
 LOG_DIR = (
@@ -141,8 +176,11 @@ LOG_DIR = (
         f"{args.attack}_{args.agg}_tau{args.clip_tau}_m{args.momentum}"
         f"_mom{args.momentum_mode}"
         f"_model{args.model}"
+        f"_lr{args.lr}"
         f"_center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
         f"-scale{args.center_scale}"
+        f"_alpha{args.residual_alpha}"
+        f"_{DP_NOISE_LABEL}"
         f"_local{args.local_steps}"
         f"_seed{args.seed}"
     )
@@ -177,6 +215,19 @@ def _get_aggregator():
             center_scale=args.center_scale,
         )
 
+    if args.agg == "dp-residual":
+        return CentralDPResidualTracking(
+            residual_clip_tau=args.clip_tau,
+            residual_alpha=args.residual_alpha,
+            noise_multiplier=args.dp_noise_multiplier,
+        )
+
+    if args.agg == "dp-fedavg":
+        return CentralDPFedAvg(
+            clip_tau=args.clip_tau,
+            noise_multiplier=args.dp_noise_multiplier,
+        )
+
     raise NotImplementedError(args.agg)
 
 
@@ -193,16 +244,27 @@ def initialize_worker(
         drop_last=True,  # Exclude the influence of non-full batch.
         **kwargs,
     )
+    worker_kwargs = {
+        "local_steps": args.local_steps,
+        "data_loader": train_loader,
+        "model": model,
+        "loss_func": loss_func,
+        "device": device,
+        "optimizer": optimizer,
+        **kwargs,
+    }
+
+    if args.agg == "dp-residual":
+        return ResidualTrackingWorker(
+            residual_clip_tau=args.clip_tau,
+            residual_alpha=args.residual_alpha,
+            **worker_kwargs,
+        )
+
     return WorkerWithMomentum(
         momentum=MOMENTUM,
         momentum_mode=args.momentum_mode,
-        local_steps=args.local_steps,
-        data_loader=train_loader,
-        model=model,
-        loss_func=loss_func,
-        device=device,
-        optimizer=optimizer,
-        **kwargs,
+        **worker_kwargs,
     )
 
 
@@ -220,8 +282,11 @@ def maybe_init_wandb():
             f"noattack-{args.agg}-tau{args.clip_tau}-m{args.momentum}"
             f"-mom{args.momentum_mode}"
             f"-model{args.model}"
+            f"-lr{args.lr}"
             f"-center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
             f"-scale{args.center_scale}"
+            f"-alpha{args.residual_alpha}"
+            f"-{DP_NOISE_LABEL}"
             f"-local{args.local_steps}"
             f"-seed{args.seed}"
         )
@@ -234,6 +299,7 @@ def maybe_init_wandb():
             "attack": args.attack,
             "agg": args.agg,
             "model": args.model,
+            "lr": args.lr,
             "clip_tau": args.clip_tau,
             "inner_iterations": args.inner_iterations,
             "momentum": args.momentum,
@@ -244,17 +310,52 @@ def maybe_init_wandb():
             "center_source": args.center_source,
             "center_scale": args.center_scale,
             "per_client_center_momentum": args.per_client_center_momentum,
+            "residual_alpha": args.residual_alpha,
+            "dp_noise_multiplier": args.dp_noise_multiplier,
+            "requested_dp_noise_multiplier": args.dp_noise_multiplier,
+            "target_epsilon": args.target_epsilon,
+            "target_delta": args.target_delta,
+            "dp_adjacency": "add_remove",
             "seed": args.seed,
             "n_workers": N_WORKERS,
             "batch_size": BATCH_SIZE,
             "epochs": EPOCHS,
-            "lr": LR,
         },
     )
     wandb.define_metric("train/global_step")
     wandb.define_metric("train/*", step_metric="train/global_step")
     wandb.define_metric("validation/*", step_metric="train/global_step")
     return run
+
+
+def compute_full_participation_noise_multiplier(
+    target_epsilon, target_delta, total_rounds
+):
+    if target_epsilon is None:
+        return None
+    if target_epsilon <= 0:
+        raise ValueError(f"target_epsilon must be > 0. Got {target_epsilon}.")
+    if not 0 < target_delta < 1:
+        raise ValueError(f"target_delta must be in (0, 1). Got {target_delta}.")
+    if total_rounds <= 0:
+        raise ValueError(f"total_rounds must be > 0. Got {total_rounds}.")
+
+    log_inv_delta = np.log(1.0 / target_delta)
+    sqrt_rho = np.sqrt(log_inv_delta + target_epsilon) - np.sqrt(log_inv_delta)
+    rho = max(float(sqrt_rho**2), 1e-16)
+    return np.sqrt(total_rounds / (2.0 * rho))
+
+
+def compute_full_participation_epsilon(noise_multiplier, target_delta, total_rounds):
+    if noise_multiplier <= 0:
+        return float("inf")
+    if not 0 < target_delta < 1:
+        raise ValueError(f"target_delta must be in (0, 1). Got {target_delta}.")
+    if total_rounds <= 0:
+        raise ValueError(f"total_rounds must be > 0. Got {total_rounds}.")
+
+    rho = total_rounds / (2.0 * noise_multiplier**2)
+    return rho + 2.0 * np.sqrt(rho * np.log(1.0 / target_delta))
 
 
 class PerClientHistoryDiagnostics:
@@ -363,8 +464,13 @@ def make_wandb_post_batch_hook():
             per_client_diagnostics = history_tracker.update(
                 getattr(trainer, "latest_worker_gradients", None)
             )
+        worker_diagnostics = [
+            getattr(worker, "latest_diagnostics", None)
+            for worker in trainer.workers
+            if getattr(worker, "latest_diagnostics", None)
+        ]
 
-        if not diagnostics and not per_client_diagnostics:
+        if not diagnostics and not per_client_diagnostics and not worker_diagnostics:
             return
 
         payload = {
@@ -373,32 +479,7 @@ def make_wandb_post_batch_hook():
             "train/global_step": trainer.global_step,
         }
         if diagnostics:
-            payload.update(
-                {
-                    "train/raw_grad_norm_mean": diagnostics["raw_grad_norm_mean"],
-                    "train/centered_grad_distance_mean": diagnostics[
-                        "centered_grad_distance_mean"
-                    ],
-                    "train/raw_grad_norm_max": diagnostics["raw_grad_norm_max"],
-                    "train/centered_grad_distance_max": diagnostics[
-                        "centered_grad_distance_max"
-                    ],
-                    "train/centered_to_raw_norm_ratio": diagnostics[
-                        "centered_to_raw_norm_ratio"
-                    ],
-                    "train/center_norm": diagnostics["center_norm"],
-                    "train/scaled_center_norm": diagnostics["scaled_center_norm"],
-                    "train/next_center_norm": diagnostics["next_center_norm"],
-                    "train/mean_update_norm": diagnostics["mean_update_norm"],
-                    "train/aggregate_norm": diagnostics["aggregate_norm"],
-                    "train/mean_cosine_with_center": diagnostics["mean_cosine_with_center"],
-                    "train/min_cosine_with_center": diagnostics["min_cosine_with_center"],
-                    "train/center_to_mean_update_norm_ratio": diagnostics[
-                        "center_to_mean_update_norm_ratio"
-                    ],
-                    "train/clip_fraction_mean": diagnostics["clip_fraction_mean"],
-                }
-            )
+            payload.update({f"train/{key}": value for key, value in diagnostics.items()})
         if per_client_diagnostics:
             payload.update(
                 {
@@ -434,6 +515,14 @@ def make_wandb_post_batch_hook():
                     ],
                 }
             )
+        if worker_diagnostics:
+            for key in worker_diagnostics[0]:
+                values = torch.tensor(
+                    [diagnostic[key] for diagnostic in worker_diagnostics],
+                    dtype=torch.float32,
+                )
+                payload[f"train/dp_client_{key}_mean"] = values.mean().item()
+                payload[f"train/dp_client_{key}_max"] = values.max().item()
         wandb.log(payload, step=trainer.global_step)
 
     return hook
@@ -456,18 +545,19 @@ def main(args):
 
     model = get_resnet(model=args.model, use_cuda=args.use_cuda, gn=False).to(device)
     # NOTE: no momentum
-    optimizer = torch.optim.SGD(model.parameters(), lr=LR)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
     loss_func = CrossEntropyLoss().to(device)
 
     metrics = {"top1": top1_accuracy}
 
-    server_opt = torch.optim.SGD(model.parameters(), lr=LR)
+    server_opt = torch.optim.SGD(model.parameters(), lr=args.lr)
     server = TorchServer(server_opt)
 
     post_batch_hooks = [make_wandb_post_batch_hook()] if args.wandb else []
+    aggregator = _get_aggregator()
     trainer = ParallelTrainer(
         server=server,
-        aggregator=_get_aggregator(),
+        aggregator=aggregator,
         pre_batch_hooks=[],
         post_batch_hooks=post_batch_hooks,
         max_batches_per_epoch=MAX_BATCHES_PER_EPOCH,
@@ -476,8 +566,12 @@ def main(args):
         use_cuda=args.use_cuda,
         debug=False,
     )
-    trainer.per_client_history_tracker = PerClientHistoryDiagnostics(
-        center_momentum=args.per_client_center_momentum
+    trainer.per_client_history_tracker = (
+        None
+        if args.agg == "dp-residual"
+        else PerClientHistoryDiagnostics(
+            center_momentum=args.per_client_center_momentum
+        )
     )
 
     test_loader = cifar10(
@@ -490,7 +584,7 @@ def main(args):
     )
 
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        server_opt, milestones=[75], gamma=LR
+        server_opt, milestones=[75], gamma=0.1
     )
 
     evaluator = DistributedEvaluator(
@@ -513,6 +607,53 @@ def main(args):
             kwargs={},
         )
         trainer.add_worker(worker)
+
+    rounds_per_epoch = min(MAX_BATCHES_PER_EPOCH, len(trainer.workers[0].data_loader))
+    total_rounds = EPOCHS * rounds_per_epoch
+    if args.target_epsilon is not None:
+        if args.agg not in ["dp-fedavg", "dp-residual"]:
+            raise ValueError(
+                "--target-epsilon is only supported for --agg dp-fedavg and --agg dp-residual."
+            )
+        computed_noise_multiplier = compute_full_participation_noise_multiplier(
+            target_epsilon=args.target_epsilon,
+            target_delta=args.target_delta,
+            total_rounds=total_rounds,
+        )
+        trainer.aggregator.noise_multiplier = computed_noise_multiplier
+    else:
+        computed_noise_multiplier = args.dp_noise_multiplier
+    effective_epsilon = compute_full_participation_epsilon(
+        noise_multiplier=computed_noise_multiplier,
+        target_delta=args.target_delta,
+        total_rounds=total_rounds,
+    )
+
+    trainer.accountant_summary = {
+        "rounds_per_epoch": rounds_per_epoch,
+        "total_rounds": total_rounds,
+        "target_epsilon": args.target_epsilon,
+        "target_delta": args.target_delta,
+        "effective_noise_multiplier": computed_noise_multiplier,
+        "effective_epsilon": effective_epsilon,
+    }
+    print(
+        "DP accountant:"
+        f" rounds_per_epoch={rounds_per_epoch}, total_rounds={total_rounds},"
+        f" noise_multiplier={computed_noise_multiplier:.6f},"
+        f" epsilon={effective_epsilon:.6f}, target_delta={args.target_delta}"
+    )
+    if args.wandb and wandb.run is not None:
+        wandb.config.update(
+            {
+                "rounds_per_epoch": rounds_per_epoch,
+                "total_rounds": total_rounds,
+                "effective_noise_multiplier": computed_noise_multiplier,
+                "dp_noise_multiplier": computed_noise_multiplier,
+                "effective_epsilon": effective_epsilon,
+            },
+            allow_val_change=True,
+        )
 
     for epoch in range(1, EPOCHS + 1):
         trainer.train(epoch)

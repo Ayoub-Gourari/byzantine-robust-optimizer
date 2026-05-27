@@ -150,6 +150,8 @@ class WorkerWithMomentum(TorchWorker):
                 param_state = self.state[p]
                 if "momentum_buffer" not in param_state:
                     param_state["momentum_buffer"] = torch.clone(p.grad).detach()
+                    if self.momentum_mode == "ema":
+                        param_state["momentum_buffer"].mul_(1 - self.momentum)
                 else:
                     param_state["momentum_buffer"].mul_(self.momentum)
                     if self.momentum_mode == "classic":
@@ -166,6 +168,61 @@ class WorkerWithMomentum(TorchWorker):
                 param_state = self.state[p]
                 layer_gradients.append(param_state["momentum_buffer"].data.view(-1))
         return torch.cat(layer_gradients)
+
+
+class ResidualTrackingWorker(TorchWorker):
+    """Client-side residual tracker for private residual-tracking FedAvg."""
+
+    def __init__(self, residual_clip_tau, residual_alpha, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.residual_clip_tau = residual_clip_tau
+        self.residual_alpha = residual_alpha
+        self.private_tracker = None
+        self.latest_diagnostics = {}
+
+    def _clip(self, v):
+        v_norm = torch.norm(v)
+        scale = min(1, self.residual_clip_tau / v_norm.clamp_min(1e-12).item())
+        return v * scale
+
+    def _flatten_current_gradient(self):
+        layer_gradients = []
+        for group in self.optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                layer_gradients.append(p.grad.detach().view(-1))
+        return torch.cat(layer_gradients)
+
+    def _save_grad(self) -> None:
+        raw_update = self._flatten_current_gradient()
+        if self.private_tracker is None:
+            self.private_tracker = torch.zeros_like(raw_update)
+
+        residual = raw_update - self.private_tracker
+        clipped_residual = self._clip(residual)
+        clipped_residual_norm = torch.norm(clipped_residual).item()
+        residual_norm = torch.norm(residual).item()
+        raw_update_norm = torch.norm(raw_update).item()
+
+        self.private_tracker = (
+            self.private_tracker + self.residual_alpha * clipped_residual.detach()
+        )
+        self.state["residual_tracking"]["saved_residual"] = clipped_residual.detach()
+        self.latest_diagnostics = {
+            "raw_update_norm": raw_update_norm,
+            "private_tracker_norm": torch.norm(self.private_tracker).item(),
+            "residual_norm": residual_norm,
+            "clipped_residual_norm": clipped_residual_norm,
+            "residual_to_raw_norm_ratio": residual_norm / max(raw_update_norm, 1e-12),
+            "clip_fraction": float(residual_norm > self.residual_clip_tau),
+        }
+
+    def _get_saved_grad(self) -> torch.Tensor:
+        return self.state["residual_tracking"]["saved_residual"].data
+
+    def __str__(self) -> str:
+        return "ResidualTrackingWorker"
 
 
 class ByzantineWorker(TorchWorker):
