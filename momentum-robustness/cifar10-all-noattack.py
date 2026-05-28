@@ -215,7 +215,7 @@ N_BYZ = 0
 BATCH_SIZE = 32
 TEST_BATCH_SIZE = 128
 MAX_BATCHES_PER_EPOCH = 9999999
-EPOCHS = 100
+EPOCHS = 70
 MOMENTUM = args.momentum
 ANCHOR_CLIP_TAU = (
     args.anchor_clip_tau if args.anchor_clip_tau is not None else args.clip_tau
