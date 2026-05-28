@@ -101,6 +101,9 @@ class TorchWorker(object):
     def get_gradient(self) -> torch.Tensor:
         return self._get_saved_grad()
 
+    def finalize_private_state(self) -> None:
+        pass
+
     def apply_gradient(self) -> None:
         self.optimizer.step()
 
@@ -271,7 +274,7 @@ class ResidualTrackingWorker(TorchWorker):
 
 
 class AnchorResetResidualTrackingWorker(TorchWorker):
-    """Client residual tracker that also exposes the current private center."""
+    """Client residual tracker that exposes old centers and stages center updates."""
 
     def __init__(
         self,
@@ -298,6 +301,7 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
             )
         self.residual_center_mode = normalized_mode
         self.private_center = None
+        self.pending_private_center = None
         self.latest_diagnostics = {}
 
     def _clip(self, v):
@@ -328,18 +332,19 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
         center_norm = torch.norm(center_before).item()
 
         if self.residual_center_mode == "ema":
-            self.private_center = (
+            next_private_center = (
                 self.residual_center_beta * center_before
                 + (1 - self.residual_center_beta) * raw_update.detach()
             )
         else:
-            self.private_center = (
+            next_private_center = (
                 center_before + self.residual_alpha * clipped_residual.detach()
             )
+        self.pending_private_center = next_private_center.detach()
 
         self.state["residual_tracking_anchor"]["payload"] = {
             "clipped_residual": clipped_residual.detach(),
-            "client_center": self.private_center.detach(),
+            "client_center": center_before.detach(),
             "raw_update_norm": raw_update_norm,
             "residual_norm": residual_norm,
             "clipped_residual_norm": clipped_residual_norm,
@@ -348,7 +353,7 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
         self.latest_diagnostics = {
             "raw_update_norm": raw_update_norm,
             "private_center_norm": center_norm,
-            "next_private_center_norm": torch.norm(self.private_center).item(),
+            "next_private_center_norm": torch.norm(self.pending_private_center).item(),
             "residual_norm": residual_norm,
             "clipped_residual_norm": clipped_residual_norm,
             "residual_to_raw_norm_ratio": residual_norm / max(raw_update_norm, 1e-12),
@@ -360,6 +365,11 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
 
     def _get_saved_grad(self):
         return self.state["residual_tracking_anchor"]["payload"]
+
+    def finalize_private_state(self) -> None:
+        if self.pending_private_center is not None:
+            self.private_center = self.pending_private_center
+            self.pending_private_center = None
 
     def __str__(self) -> str:
         return "AnchorResetResidualTrackingWorker"

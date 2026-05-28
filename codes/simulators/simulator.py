@@ -191,6 +191,7 @@ class ParallelTrainer(DistributedTrainerBase):
         # Assume that the model and optimizers are shared among workers.
         self.server.set_gradient(aggregated)
         self.server.apply_gradient()
+        self.parallel_call(lambda w: w.finalize_private_state())
 
     def train(self, epoch):
         self.debug_logger.info(f"Train epoch {epoch}")

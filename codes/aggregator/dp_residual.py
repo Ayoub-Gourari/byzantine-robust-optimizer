@@ -167,8 +167,10 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
         anchor_noise_std = gaussian_noise_std(
             self.anchor_noise_multiplier, anchor_sensitivity
         )
-        residual_noise_norm = 0.0
-        residual_noisy_delta_norm = 0.0
+        residual_noise = torch.randn_like(mean_clipped_residual) * residual_noise_std
+        noisy_delta = self.residual_alpha * mean_clipped_residual + residual_noise
+        residual_noise_norm = torch.norm(residual_noise).item()
+        residual_noisy_delta_norm = torch.norm(noisy_delta).item()
         anchor_noise_norm = 0.0
 
         if is_anchor_round:
@@ -178,16 +180,15 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             )
             mean_clipped_center = clipped_centers.mean(dim=0)
             anchor_noise = torch.randn_like(mean_clipped_center) * anchor_noise_std
-            self.public_tracker = (mean_clipped_center + anchor_noise).detach()
+            anchor = mean_clipped_center + anchor_noise
+            self.public_tracker = (anchor + noisy_delta).detach()
             anchor_noise_norm = torch.norm(anchor_noise).item()
             anchor_clipped_norms = torch.norm(clipped_centers, dim=1)
+            anchor_norm = torch.norm(anchor).item()
         else:
-            residual_noise = torch.randn_like(mean_clipped_residual) * residual_noise_std
-            noisy_delta = self.residual_alpha * mean_clipped_residual + residual_noise
             self.public_tracker = (self.public_tracker + noisy_delta).detach()
-            residual_noise_norm = torch.norm(residual_noise).item()
-            residual_noisy_delta_norm = torch.norm(noisy_delta).item()
             anchor_clipped_norms = torch.zeros_like(center_norms)
+            anchor_norm = 0.0
 
         self.latest_diagnostics = {
             "round_index": self.round_index,
@@ -200,6 +201,7 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             "anchor_period": self.anchor_period,
             "dp_residual_sensitivity": residual_sensitivity,
             "dp_anchor_sensitivity": anchor_sensitivity,
+            "dp_anchor_from_preupdate_centers": 1.0 if is_anchor_round else 0.0,
             "server_center_norm": torch.norm(self.public_tracker).item(),
             "residual_to_raw_norm_ratio_mean": (
                 residual_norms / raw_update_norms.clamp_min(1e-12)
@@ -213,7 +215,7 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             "dp_residual_clipped_norm_mean": clipped_residual_norms.mean().item(),
             "dp_residual_clipped_norm_max": clipped_residual_norms.max().item(),
             "dp_residual_mean_norm": torch.norm(mean_clipped_residual).item(),
-            "dp_residual_noise_std": residual_noise_std if not is_anchor_round else 0.0,
+            "dp_residual_noise_std": residual_noise_std,
             "dp_residual_noise_norm": residual_noise_norm,
             "dp_residual_noisy_delta_norm": residual_noisy_delta_norm,
             "dp_anchor_center_norm_mean": center_norms.mean().item(),
@@ -221,6 +223,7 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             "dp_anchor_clipped_center_norm_mean": anchor_clipped_norms.mean().item(),
             "dp_anchor_noise_std": anchor_noise_std if is_anchor_round else 0.0,
             "dp_anchor_noise_norm": anchor_noise_norm,
+            "dp_anchor_norm": anchor_norm,
             "dp_public_tracker_norm": torch.norm(self.public_tracker).item(),
         }
         self.round_index += 1
