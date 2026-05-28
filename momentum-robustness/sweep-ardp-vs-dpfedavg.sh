@@ -20,6 +20,7 @@ NOISE_MULTIPLIER="${NOISE_MULTIPLIER:-0.1}"
 ANCHOR_NOISE_MULTIPLIER="${ANCHOR_NOISE_MULTIPLIER:-$NOISE_MULTIPLIER}"
 TARGET_DELTA="${TARGET_DELTA:-2e-5}"
 RUN_FULL_GRID="${RUN_FULL_GRID:-1}"
+RUN_FEDAVG_SWEEP="${RUN_FEDAVG_SWEEP:-0}"
 
 # Phase 1: keep the search small and identify the best learning rate first.
 LR_SWEEP_FEDAVG_CLIPS=(${LR_SWEEP_FEDAVG_CLIPS:-1.6})
@@ -43,8 +44,8 @@ EMA_BETAS=(${EMA_BETAS:-0.8 0.7})
 
 # Full-grid mode: trimmed by default to the strongest practical candidates.
 FULL_GRID_FEDAVG_CLIPS=(${FULL_GRID_FEDAVG_CLIPS:-1.6})
-FULL_GRID_ARDP_CRES=(${FULL_GRID_ARDP_CRES:-0.7 0.8})
-FULL_GRID_ARDP_CANCHOR=(${FULL_GRID_ARDP_CANCHOR:-1.5 1.8})
+FULL_GRID_ARDP_CRES=(${FULL_GRID_ARDP_CRES:-0.55 0.7 0.8})
+FULL_GRID_ARDP_CANCHOR=(${FULL_GRID_ARDP_CANCHOR:-0.85 1.5 1.8})
 FULL_GRID_ARDP_ALPHAS=(${FULL_GRID_ARDP_ALPHAS:-0.2 0.3})
 FULL_GRID_ARDP_PERIODS=(${FULL_GRID_ARDP_PERIODS:-100 200})
 FULL_GRID_EMA_BETAS=(${FULL_GRID_EMA_BETAS:-0.8 0.7})
@@ -132,9 +133,11 @@ run_full_grid() {
   echo "=== Full grid: learning-rate-outer sweep ==="
   for lr in "${LRS[@]}"; do
     for seed in "${SEEDS[@]}"; do
-      for clip_tau in "${FULL_GRID_FEDAVG_CLIPS[@]}"; do
-        run_fedavg "$lr" "$clip_tau" "$seed" "fullgrid"
-      done
+      if [[ "$RUN_FEDAVG_SWEEP" == "1" ]]; then
+        for clip_tau in "${FULL_GRID_FEDAVG_CLIPS[@]}"; do
+          run_fedavg "$lr" "$clip_tau" "$seed" "fullgrid"
+        done
+      fi
 
       for c_res in "${FULL_GRID_ARDP_CRES[@]}"; do
         for c_anchor in "${FULL_GRID_ARDP_CANCHOR[@]}"; do
