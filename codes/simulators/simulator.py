@@ -11,6 +11,17 @@ from .worker import TorchWorker
 from .server import TorchServer
 
 
+def _clone_gradient_payload(gradient):
+    if torch.is_tensor(gradient):
+        return gradient.detach().clone()
+    if isinstance(gradient, dict):
+        return {
+            key: value.detach().clone() if torch.is_tensor(value) else copy.deepcopy(value)
+            for key, value in gradient.items()
+        }
+    return copy.deepcopy(gradient)
+
+
 class DistributedSimulatorBase(object):
     """Simulate distributed programs with low memory usage.
 
@@ -173,7 +184,7 @@ class ParallelTrainer(DistributedTrainerBase):
             omniscient_attacker_callback()
 
         gradients = self.parallel_get(lambda w: w.get_gradient())
-        self.latest_worker_gradients = [g.detach().clone() for g in gradients]
+        self.latest_worker_gradients = [_clone_gradient_payload(g) for g in gradients]
 
         aggregated = self.aggregator(gradients)
 
@@ -222,6 +233,10 @@ class ParallelTrainer(DistributedTrainerBase):
                 sum(res["metrics"][metric_name] * res["length"] for res in results)
                 / length
             )
+
+        diagnostics = getattr(self.aggregator, "latest_diagnostics", None)
+        if diagnostics:
+            r.update(diagnostics)
 
         # Output to console
         total = len(self.workers[0].data_loader.dataset)
@@ -286,6 +301,8 @@ class DistributedEvaluator(DistributedSimulatorBase):
         for name in self.metrics:
             r[name] /= r["Length"]
         r["Loss"] /= r["Length"]
+        if "top1" in r:
+            r["accuracy"] = r["top1"]
 
         # Output to file
         self.json_logger.info(r)

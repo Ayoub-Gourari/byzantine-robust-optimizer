@@ -270,6 +270,101 @@ class ResidualTrackingWorker(TorchWorker):
         return "ResidualTrackingWorker"
 
 
+class AnchorResetResidualTrackingWorker(TorchWorker):
+    """Client residual tracker that also exposes the current private center."""
+
+    def __init__(
+        self,
+        residual_clip_tau,
+        residual_alpha,
+        residual_center_mode="ema",
+        residual_center_beta=0.9,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.residual_clip_tau = residual_clip_tau
+        self.residual_alpha = residual_alpha
+        self.residual_center_beta = residual_center_beta
+        normalized_mode = residual_center_mode.replace("-", "_")
+        if normalized_mode not in ["ema", "clipped_residual_ema"]:
+            raise ValueError(
+                "Unknown residual_center_mode for anchor resets: "
+                f"{residual_center_mode}."
+            )
+        if not 0 <= residual_center_beta <= 1:
+            raise ValueError(
+                f"residual_center_beta must be in [0, 1]. Got {residual_center_beta}."
+            )
+        self.residual_center_mode = normalized_mode
+        self.private_center = None
+        self.latest_diagnostics = {}
+
+    def _clip(self, v):
+        v_norm = torch.norm(v)
+        scale = min(1, self.residual_clip_tau / v_norm.clamp_min(1e-12).item())
+        return v * scale
+
+    def _flatten_current_gradient(self):
+        layer_gradients = []
+        for group in self.optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                layer_gradients.append(p.grad.detach().view(-1))
+        return torch.cat(layer_gradients)
+
+    def _save_grad(self) -> None:
+        raw_update = self._flatten_current_gradient()
+        if self.private_center is None:
+            self.private_center = torch.zeros_like(raw_update)
+
+        center_before = self.private_center
+        residual = raw_update - center_before
+        clipped_residual = self._clip(residual)
+        clipped_residual_norm = torch.norm(clipped_residual).item()
+        residual_norm = torch.norm(residual).item()
+        raw_update_norm = torch.norm(raw_update).item()
+        center_norm = torch.norm(center_before).item()
+
+        if self.residual_center_mode == "ema":
+            self.private_center = (
+                self.residual_center_beta * center_before
+                + (1 - self.residual_center_beta) * raw_update.detach()
+            )
+        else:
+            self.private_center = (
+                center_before + self.residual_alpha * clipped_residual.detach()
+            )
+
+        self.state["residual_tracking_anchor"]["payload"] = {
+            "clipped_residual": clipped_residual.detach(),
+            "client_center": self.private_center.detach(),
+            "raw_update_norm": raw_update_norm,
+            "residual_norm": residual_norm,
+            "clipped_residual_norm": clipped_residual_norm,
+            "residual_was_clipped": float(residual_norm > self.residual_clip_tau),
+        }
+        self.latest_diagnostics = {
+            "raw_update_norm": raw_update_norm,
+            "private_center_norm": center_norm,
+            "next_private_center_norm": torch.norm(self.private_center).item(),
+            "residual_norm": residual_norm,
+            "clipped_residual_norm": clipped_residual_norm,
+            "residual_to_raw_norm_ratio": residual_norm / max(raw_update_norm, 1e-12),
+            "clip_fraction": float(residual_norm > self.residual_clip_tau),
+            "center_update_mode_id": float(
+                0 if self.residual_center_mode == "ema" else 1
+            ),
+        }
+
+    def _get_saved_grad(self):
+        return self.state["residual_tracking_anchor"]["payload"]
+
+    def __str__(self) -> str:
+        return "AnchorResetResidualTrackingWorker"
+
+
 class ByzantineWorker(TorchWorker):
     def configure(self, simulator):
         # call configure after defining DistribtuedSimulator

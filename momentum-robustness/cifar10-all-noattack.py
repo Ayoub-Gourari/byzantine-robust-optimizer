@@ -12,14 +12,23 @@ from codes.simulators.simulator import (
     ParallelTrainer,
     DistributedEvaluator,
 )
-from codes.simulators.worker import ResidualTrackingWorker, WorkerWithMomentum
+from codes.simulators.worker import (
+    AnchorResetResidualTrackingWorker,
+    ResidualTrackingWorker,
+    WorkerWithMomentum,
+)
 from codes.simulators.server import TorchServer
 
 from codes.tasks.cifar10 import cifar10, get_resnet
 from codes.utils import top1_accuracy, initialize_logger
 from codes.aggregator.clipping import Clipping
 from codes.aggregator.base import Mean
-from codes.aggregator.dp_residual import CentralDPFedAvg, CentralDPResidualTracking
+from codes.aggregator.dp_residual import (
+    CentralDPFedAvg,
+    CentralDPResidualTracking,
+    ResidualTrackingDPFedAvgWithAnchorResets,
+    full_participation_add_remove_sensitivity,
+)
 
 try:
     import wandb
@@ -45,7 +54,10 @@ parser.add_argument(
     "--agg",
     type=str,
     default="cp",
-    help="Aggregator. Use dp-residual or dp-fedavg for central-DP baselines.",
+    help=(
+        "Aggregator. Use dp-fedavg, dp-residual, or dp-residual-anchor for "
+        "central-DP baselines."
+    ),
 )
 parser.add_argument(
     "--model",
@@ -112,20 +124,55 @@ parser.add_argument(
     "--residual-alpha",
     type=float,
     default=1.0,
-    help="Client tracker step size for --agg dp-residual.",
+    help="Client tracker step size for residual-tracking DP methods.",
 )
 parser.add_argument(
     "--residual-center-mode",
     type=str,
     default="ema",
-    choices=["ema", "buffer"],
-    help="Client-side center update for --agg dp-residual.",
+    choices=["ema", "buffer", "clipped-residual-ema", "clipped_residual_ema"],
+    help=(
+        "Client-side center update. For dp-residual this preserves the legacy "
+        "ema/buffer behavior. For dp-residual-anchor, use ema for "
+        "c_i = beta c_i + (1 - beta) g_i or clipped-residual-ema for "
+        "c_i = c_i + alpha clip(g_i - c_i)."
+    ),
+)
+parser.add_argument(
+    "--residual-center-beta",
+    type=float,
+    default=0.9,
+    help="EMA beta for --agg dp-residual-anchor when --residual-center-mode ema.",
 )
 parser.add_argument(
     "--dp-noise-multiplier",
     type=float,
     default=0.0,
-    help="Central Gaussian noise multiplier for --agg dp-fedavg and --agg dp-residual with add/remove adjacency.",
+    help=(
+        "Central Gaussian noise multiplier for DP-FedAvg and residual releases "
+        "with add/remove adjacency."
+    ),
+)
+parser.add_argument(
+    "--dp-anchor-noise-multiplier",
+    type=float,
+    default=None,
+    help=(
+        "Central Gaussian noise multiplier for anchor resets. Defaults to "
+        "--dp-noise-multiplier."
+    ),
+)
+parser.add_argument(
+    "--anchor-clip-tau",
+    type=float,
+    default=None,
+    help="Clipping radius C_anchor for --agg dp-residual-anchor.",
+)
+parser.add_argument(
+    "--anchor-period",
+    type=int,
+    default=100,
+    help="Reset server center every anchor_period rounds for dp-residual-anchor.",
 )
 parser.add_argument(
     "--target-epsilon",
@@ -169,10 +216,28 @@ TEST_BATCH_SIZE = 128
 MAX_BATCHES_PER_EPOCH = 9999999
 EPOCHS = 100
 MOMENTUM = args.momentum
+ANCHOR_CLIP_TAU = (
+    args.anchor_clip_tau if args.anchor_clip_tau is not None else args.clip_tau
+)
+ANCHOR_NOISE_MULTIPLIER = (
+    args.dp_anchor_noise_multiplier
+    if args.dp_anchor_noise_multiplier is not None
+    else args.dp_noise_multiplier
+)
 DP_NOISE_LABEL = (
     f"eps{args.target_epsilon}-delta{args.target_delta}"
     if args.target_epsilon is not None
     else f"sigma{args.dp_noise_multiplier}"
+)
+ANCHOR_LABEL = (
+    ""
+    if args.agg != "dp-residual-anchor"
+    else (
+        f"_Canchor{ANCHOR_CLIP_TAU}"
+        f"_sanchor{ANCHOR_NOISE_MULTIPLIER}"
+        f"_aperiod{args.anchor_period}"
+        f"_beta{args.residual_center_beta}"
+    )
 )
 
 # LOG_DIR = EXP_DIR + "log"
@@ -187,6 +252,7 @@ LOG_DIR = (
         f"_center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
         f"-scale{args.center_scale}"
         f"_rcenter{args.residual_center_mode}-alpha{args.residual_alpha}"
+        f"{ANCHOR_LABEL}"
         f"_{DP_NOISE_LABEL}"
         f"_local{args.local_steps}"
         f"_seed{args.seed}"
@@ -229,6 +295,16 @@ def _get_aggregator():
             noise_multiplier=args.dp_noise_multiplier,
         )
 
+    if args.agg == "dp-residual-anchor":
+        return ResidualTrackingDPFedAvgWithAnchorResets(
+            residual_clip_tau=args.clip_tau,
+            anchor_clip_tau=ANCHOR_CLIP_TAU,
+            residual_alpha=args.residual_alpha,
+            residual_noise_multiplier=args.dp_noise_multiplier,
+            anchor_noise_multiplier=ANCHOR_NOISE_MULTIPLIER,
+            anchor_period=args.anchor_period,
+        )
+
     if args.agg == "dp-fedavg":
         return CentralDPFedAvg(
             clip_tau=args.clip_tau,
@@ -262,10 +338,24 @@ def initialize_worker(
     }
 
     if args.agg == "dp-residual":
+        residual_center_mode = (
+            "ema"
+            if args.residual_center_mode.replace("-", "_") == "clipped_residual_ema"
+            else args.residual_center_mode
+        )
         return ResidualTrackingWorker(
             residual_clip_tau=args.clip_tau,
             residual_alpha=args.residual_alpha,
+            residual_center_mode=residual_center_mode,
+            **worker_kwargs,
+        )
+
+    if args.agg == "dp-residual-anchor":
+        return AnchorResetResidualTrackingWorker(
+            residual_clip_tau=args.clip_tau,
+            residual_alpha=args.residual_alpha,
             residual_center_mode=args.residual_center_mode,
+            residual_center_beta=args.residual_center_beta,
             **worker_kwargs,
         )
 
@@ -294,6 +384,7 @@ def maybe_init_wandb():
             f"-center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
             f"-scale{args.center_scale}"
             f"-rcenter{args.residual_center_mode}-alpha{args.residual_alpha}"
+            f"{ANCHOR_LABEL}"
             f"-{DP_NOISE_LABEL}"
             f"-local{args.local_steps}"
             f"-seed{args.seed}"
@@ -320,8 +411,13 @@ def maybe_init_wandb():
             "per_client_center_momentum": args.per_client_center_momentum,
             "residual_alpha": args.residual_alpha,
             "residual_center_mode": args.residual_center_mode,
+            "residual_center_beta": args.residual_center_beta,
             "dp_noise_multiplier": args.dp_noise_multiplier,
+            "dp_anchor_noise_multiplier": ANCHOR_NOISE_MULTIPLIER,
+            "anchor_clip_tau": ANCHOR_CLIP_TAU,
+            "anchor_period": args.anchor_period,
             "requested_dp_noise_multiplier": args.dp_noise_multiplier,
+            "requested_dp_anchor_noise_multiplier": ANCHOR_NOISE_MULTIPLIER,
             "target_epsilon": args.target_epsilon,
             "target_delta": args.target_delta,
             "dp_adjacency": "add_remove",
@@ -355,16 +451,107 @@ def compute_full_participation_noise_multiplier(
     return np.sqrt(total_rounds / (2.0 * rho))
 
 
-def compute_full_participation_epsilon(noise_multiplier, target_delta, total_rounds):
-    if noise_multiplier <= 0:
+def compute_epsilon_from_rho(rho, target_delta):
+    if rho == float("inf"):
         return float("inf")
     if not 0 < target_delta < 1:
         raise ValueError(f"target_delta must be in (0, 1). Got {target_delta}.")
+    return rho + 2.0 * np.sqrt(rho * np.log(1.0 / target_delta))
+
+
+def compute_composed_full_participation_epsilon(mechanisms, target_delta):
+    total_rho = 0.0
+    for mechanism in mechanisms:
+        releases = mechanism["releases"]
+        noise_multiplier = mechanism["noise_multiplier"]
+        if releases <= 0:
+            continue
+        if noise_multiplier <= 0:
+            return float("inf")
+        total_rho += releases / (2.0 * noise_multiplier**2)
+    return compute_epsilon_from_rho(total_rho, target_delta)
+
+
+def compute_full_participation_epsilon(noise_multiplier, target_delta, total_rounds):
     if total_rounds <= 0:
         raise ValueError(f"total_rounds must be > 0. Got {total_rounds}.")
 
-    rho = total_rounds / (2.0 * noise_multiplier**2)
-    return rho + 2.0 * np.sqrt(rho * np.log(1.0 / target_delta))
+    return compute_composed_full_participation_epsilon(
+        [
+            {
+                "name": "single",
+                "releases": total_rounds,
+                "noise_multiplier": noise_multiplier,
+            }
+        ],
+        target_delta,
+    )
+
+
+def count_anchor_rounds(total_rounds, anchor_period):
+    if anchor_period < 1:
+        raise ValueError(f"anchor_period must be >= 1. Got {anchor_period}.")
+    if total_rounds <= 0:
+        return 0
+    return ((total_rounds - 1) // anchor_period) + 1
+
+
+def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):
+    if args.agg == "dp-fedavg":
+        sensitivity = full_participation_add_remove_sensitivity(
+            args.clip_tau, N_WORKERS
+        )
+        return [
+            {
+                "name": "dp_fedavg",
+                "releases": total_rounds,
+                "sensitivity": sensitivity,
+                "noise_multiplier": residual_sigma,
+                "noise_std": residual_sigma * sensitivity,
+            }
+        ]
+
+    if args.agg == "dp-residual":
+        sensitivity = full_participation_add_remove_sensitivity(
+            args.clip_tau, N_WORKERS, scale=args.residual_alpha
+        )
+        return [
+            {
+                "name": "residual",
+                "releases": total_rounds,
+                "sensitivity": sensitivity,
+                "noise_multiplier": residual_sigma,
+                "noise_std": residual_sigma * sensitivity,
+            }
+        ]
+
+    if args.agg == "dp-residual-anchor":
+        anchor_releases = count_anchor_rounds(total_rounds, args.anchor_period)
+        residual_releases = total_rounds - anchor_releases
+        residual_sensitivity = full_participation_add_remove_sensitivity(
+            args.clip_tau, N_WORKERS, scale=args.residual_alpha
+        )
+        anchor_sensitivity = full_participation_add_remove_sensitivity(
+            ANCHOR_CLIP_TAU, N_WORKERS
+        )
+        return [
+            {
+                "name": "residual",
+                "releases": residual_releases,
+                "sensitivity": residual_sensitivity,
+                "noise_multiplier": residual_sigma,
+                "noise_std": residual_sigma * residual_sensitivity,
+            },
+            {
+                "name": "anchor",
+                "releases": anchor_releases,
+                "sensitivity": anchor_sensitivity,
+                "noise_multiplier": anchor_sigma,
+                "noise_std": anchor_sigma * anchor_sensitivity,
+            },
+        ]
+
+    return []
 
 
 class PerClientHistoryDiagnostics:
@@ -532,6 +719,16 @@ def make_wandb_post_batch_hook():
                 )
                 payload[f"train/dp_client_{key}_mean"] = values.mean().item()
                 payload[f"train/dp_client_{key}_max"] = values.max().item()
+                if key == "residual_to_raw_norm_ratio":
+                    payload.setdefault(
+                        "train/residual_to_raw_norm_ratio_mean",
+                        values.mean().item(),
+                    )
+                if key == "clip_fraction":
+                    payload.setdefault(
+                        "train/residual_clipping_frequency",
+                        values.mean().item(),
+                    )
         wandb.log(payload, step=trainer.global_step)
 
     return hook
@@ -546,6 +743,7 @@ def log_wandb_validation(eval_log, epoch, global_step):
             "validation/epoch": epoch,
             "validation/loss": eval_log["Loss"],
             "validation/top1": eval_log["top1"],
+            "validation/accuracy": eval_log["top1"],
             "validation/global_step": global_step,
         },
         step=global_step,
@@ -592,7 +790,7 @@ def main(args):
     )
     trainer.per_client_history_tracker = (
         None
-        if args.agg == "dp-residual"
+        if args.agg in ["dp-residual", "dp-residual-anchor"]
         else PerClientHistoryDiagnostics(
             center_momentum=args.per_client_center_momentum
         )
@@ -635,22 +833,34 @@ def main(args):
     rounds_per_epoch = min(MAX_BATCHES_PER_EPOCH, len(trainer.workers[0].data_loader))
     total_rounds = EPOCHS * rounds_per_epoch
     if args.target_epsilon is not None:
-        if args.agg not in ["dp-fedavg", "dp-residual"]:
+        if args.agg not in ["dp-fedavg", "dp-residual", "dp-residual-anchor"]:
             raise ValueError(
-                "--target-epsilon is only supported for --agg dp-fedavg and --agg dp-residual."
+                "--target-epsilon is only supported for --agg dp-fedavg, "
+                "dp-residual, and dp-residual-anchor."
             )
         computed_noise_multiplier = compute_full_participation_noise_multiplier(
             target_epsilon=args.target_epsilon,
             target_delta=args.target_delta,
             total_rounds=total_rounds,
         )
-        trainer.aggregator.noise_multiplier = computed_noise_multiplier
+        if args.agg == "dp-residual-anchor":
+            trainer.aggregator.residual_noise_multiplier = computed_noise_multiplier
+            trainer.aggregator.anchor_noise_multiplier = computed_noise_multiplier
+        else:
+            trainer.aggregator.noise_multiplier = computed_noise_multiplier
+        effective_residual_noise_multiplier = computed_noise_multiplier
+        effective_anchor_noise_multiplier = computed_noise_multiplier
     else:
-        computed_noise_multiplier = args.dp_noise_multiplier
-    effective_epsilon = compute_full_participation_epsilon(
-        noise_multiplier=computed_noise_multiplier,
-        target_delta=args.target_delta,
+        effective_residual_noise_multiplier = args.dp_noise_multiplier
+        effective_anchor_noise_multiplier = ANCHOR_NOISE_MULTIPLIER
+    accountant_mechanisms = get_dp_accountant_mechanisms(
         total_rounds=total_rounds,
+        residual_sigma=effective_residual_noise_multiplier,
+        anchor_sigma=effective_anchor_noise_multiplier,
+    )
+    effective_epsilon = compute_composed_full_participation_epsilon(
+        mechanisms=accountant_mechanisms,
+        target_delta=args.target_delta,
     )
 
     trainer.accountant_summary = {
@@ -658,13 +868,25 @@ def main(args):
         "total_rounds": total_rounds,
         "target_epsilon": args.target_epsilon,
         "target_delta": args.target_delta,
-        "effective_noise_multiplier": computed_noise_multiplier,
+        "effective_noise_multiplier": effective_residual_noise_multiplier,
+        "effective_residual_noise_multiplier": effective_residual_noise_multiplier,
+        "effective_anchor_noise_multiplier": effective_anchor_noise_multiplier,
         "effective_epsilon": effective_epsilon,
+        "mechanisms": accountant_mechanisms,
     }
+    mechanism_summary = ", ".join(
+        (
+            f"{mechanism['name']}:releases={mechanism['releases']},"
+            f"sensitivity={mechanism['sensitivity']:.6g},"
+            f"sigma={mechanism['noise_multiplier']:.6g},"
+            f"noise_std={mechanism['noise_std']:.6g}"
+        )
+        for mechanism in accountant_mechanisms
+    )
     print(
         "DP accountant:"
         f" rounds_per_epoch={rounds_per_epoch}, total_rounds={total_rounds},"
-        f" noise_multiplier={computed_noise_multiplier:.6f},"
+        f" mechanisms=[{mechanism_summary}],"
         f" epsilon={effective_epsilon:.6f}, target_delta={args.target_delta}"
     )
     if args.wandb and wandb.run is not None:
@@ -672,9 +894,13 @@ def main(args):
             {
                 "rounds_per_epoch": rounds_per_epoch,
                 "total_rounds": total_rounds,
-                "effective_noise_multiplier": computed_noise_multiplier,
-                "dp_noise_multiplier": computed_noise_multiplier,
+                "effective_noise_multiplier": effective_residual_noise_multiplier,
+                "effective_residual_noise_multiplier": effective_residual_noise_multiplier,
+                "effective_anchor_noise_multiplier": effective_anchor_noise_multiplier,
+                "dp_noise_multiplier": effective_residual_noise_multiplier,
+                "dp_anchor_noise_multiplier": effective_anchor_noise_multiplier,
                 "effective_epsilon": effective_epsilon,
+                "dp_accountant_mechanisms": accountant_mechanisms,
             },
             allow_val_change=True,
         )
