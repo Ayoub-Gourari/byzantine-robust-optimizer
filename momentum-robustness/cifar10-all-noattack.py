@@ -529,7 +529,6 @@ def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):
 
     if args.agg == "dp-residual-anchor":
         anchor_releases = count_anchor_rounds(total_rounds, args.anchor_period)
-        residual_releases = total_rounds - anchor_releases
         residual_sensitivity = full_participation_add_remove_sensitivity(
             args.clip_tau, N_WORKERS, scale=args.residual_alpha
         )
@@ -539,7 +538,7 @@ def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):
         return [
             {
                 "name": "residual",
-                "releases": residual_releases,
+                "releases": total_rounds,
                 "sensitivity": residual_sensitivity,
                 "noise_multiplier": residual_sigma,
                 "noise_std": residual_sigma * residual_sensitivity,
@@ -726,6 +725,26 @@ def make_wandb_post_batch_hook():
                         "train/residual_to_raw_norm_ratio_mean",
                         values.mean().item(),
                     )
+                if key == "stochastic_grad_norm":
+                    payload.setdefault(
+                        "train/stochastic_grad_norm_mean",
+                        values.mean().item(),
+                    )
+                if key == "effective_update_norm":
+                    payload.setdefault(
+                        "train/effective_update_norm_mean",
+                        values.mean().item(),
+                    )
+                if key == "raw_update_norm":
+                    payload.setdefault(
+                        "train/worker_raw_update_norm_mean",
+                        values.mean().item(),
+                    )
+                if key == "residual_norm":
+                    payload.setdefault(
+                        "train/worker_residual_norm_mean",
+                        values.mean().item(),
+                    )
                 if key == "clip_fraction":
                     payload.setdefault(
                         "train/residual_clipping_frequency",
@@ -840,10 +859,15 @@ def main(args):
                 "--target-epsilon is only supported for --agg dp-fedavg, "
                 "dp-residual, and dp-residual-anchor."
             )
+        calibration_rounds = total_rounds
+        if args.agg == "dp-residual-anchor":
+            calibration_rounds += count_anchor_rounds(
+                total_rounds, args.anchor_period
+            )
         computed_noise_multiplier = compute_full_participation_noise_multiplier(
             target_epsilon=args.target_epsilon,
             target_delta=args.target_delta,
-            total_rounds=total_rounds,
+            total_rounds=calibration_rounds,
         )
         if args.agg == "dp-residual-anchor":
             trainer.aggregator.residual_noise_multiplier = computed_noise_multiplier
