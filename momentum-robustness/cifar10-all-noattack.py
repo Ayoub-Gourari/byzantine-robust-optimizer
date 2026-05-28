@@ -28,6 +28,7 @@ from codes.aggregator.dp_residual import (
     CentralDPResidualTracking,
     ResidualTrackingDPFedAvgWithAnchorResets,
     full_participation_add_remove_sensitivity,
+    gaussian_noise_std,
 )
 
 try:
@@ -509,7 +510,7 @@ def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):
                 "releases": total_rounds,
                 "sensitivity": sensitivity,
                 "noise_multiplier": residual_sigma,
-                "noise_std": residual_sigma * sensitivity,
+                "noise_std": gaussian_noise_std(residual_sigma, sensitivity),
             }
         ]
 
@@ -523,7 +524,7 @@ def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):
                 "releases": total_rounds,
                 "sensitivity": sensitivity,
                 "noise_multiplier": residual_sigma,
-                "noise_std": residual_sigma * sensitivity,
+                "noise_std": gaussian_noise_std(residual_sigma, sensitivity),
             }
         ]
 
@@ -541,14 +542,16 @@ def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):
                 "releases": total_rounds,
                 "sensitivity": residual_sensitivity,
                 "noise_multiplier": residual_sigma,
-                "noise_std": residual_sigma * residual_sensitivity,
+                "noise_std": gaussian_noise_std(
+                    residual_sigma, residual_sensitivity
+                ),
             },
             {
                 "name": "anchor",
                 "releases": anchor_releases,
                 "sensitivity": anchor_sensitivity,
                 "noise_multiplier": anchor_sigma,
-                "noise_std": anchor_sigma * anchor_sensitivity,
+                "noise_std": gaussian_noise_std(anchor_sigma, anchor_sensitivity),
             },
         ]
 
