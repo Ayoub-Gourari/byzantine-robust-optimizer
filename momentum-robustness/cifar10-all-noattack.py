@@ -494,9 +494,9 @@ def compute_full_participation_epsilon(noise_multiplier, target_delta, total_rou
 def count_anchor_rounds(total_rounds, anchor_period):
     if anchor_period < 1:
         raise ValueError(f"anchor_period must be >= 1. Got {anchor_period}.")
-    if total_rounds <= 0:
+    if total_rounds <= 1:
         return 0
-    return ((total_rounds - 1) // anchor_period) + 1
+    return (total_rounds - 1) // anchor_period
 
 
 def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):

@@ -156,7 +156,11 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
         anchor_new_clip_flags = (new_center_norms > self.anchor_clip_tau).float()
         mean_clipped_residual = clipped_residuals.mean(dim=0)
 
-        is_anchor_round = self.round_index % self.anchor_period == 0
+        # Round 0 has deterministic zero centers, so adding anchor noise there only
+        # injects tracker noise without releasing data-dependent center information.
+        is_anchor_round = (
+            self.round_index > 0 and self.round_index % self.anchor_period == 0
+        )
         residual_sensitivity = full_participation_add_remove_sensitivity(
             self.residual_clip_tau,
             n_clients,
