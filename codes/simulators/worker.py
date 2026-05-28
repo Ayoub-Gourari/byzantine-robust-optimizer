@@ -345,6 +345,8 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
         self.state["residual_tracking_anchor"]["payload"] = {
             "clipped_residual": clipped_residual.detach(),
             "client_center": center_before.detach(),
+            "client_center_old": center_before.detach(),
+            "client_center_new": self.pending_private_center.detach(),
             "raw_update_norm": raw_update_norm,
             "residual_norm": residual_norm,
             "clipped_residual_norm": clipped_residual_norm,
@@ -354,6 +356,8 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
             "raw_update_norm": raw_update_norm,
             "private_center_norm": center_norm,
             "next_private_center_norm": torch.norm(self.pending_private_center).item(),
+            "old_center_norm": center_norm,
+            "new_center_norm": torch.norm(self.pending_private_center).item(),
             "residual_norm": residual_norm,
             "clipped_residual_norm": clipped_residual_norm,
             "residual_to_raw_norm_ratio": residual_norm / max(raw_update_norm, 1e-12),

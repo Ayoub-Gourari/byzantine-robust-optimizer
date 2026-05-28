@@ -125,7 +125,10 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
         clipped_residuals = torch.stack(
             [inp["clipped_residual"] for inp in inputs], dim=0
         )
-        client_centers = torch.stack([inp["client_center"] for inp in inputs], dim=0)
+        client_centers = torch.stack([inp["client_center_old"] for inp in inputs], dim=0)
+        new_client_centers = torch.stack(
+            [inp["client_center_new"] for inp in inputs], dim=0
+        )
         device = clipped_residuals.device
 
         if self.public_tracker is None:
@@ -148,7 +151,9 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
         )
         clipped_residual_norms = torch.norm(clipped_residuals, dim=1)
         center_norms = torch.norm(client_centers, dim=1)
+        new_center_norms = torch.norm(new_client_centers, dim=1)
         anchor_clip_flags = (center_norms > self.anchor_clip_tau).float()
+        anchor_new_clip_flags = (new_center_norms > self.anchor_clip_tau).float()
         mean_clipped_residual = clipped_residuals.mean(dim=0)
 
         is_anchor_round = self.round_index % self.anchor_period == 0
@@ -203,6 +208,12 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             "dp_anchor_sensitivity": anchor_sensitivity,
             "dp_anchor_from_preupdate_centers": 1.0 if is_anchor_round else 0.0,
             "server_center_norm": torch.norm(self.public_tracker).item(),
+            "raw_update_norm_mean": raw_update_norms.mean().item(),
+            "residual_norm_mean": residual_norms.mean().item(),
+            "old_center_norm_mean": center_norms.mean().item(),
+            "new_center_norm_mean": new_center_norms.mean().item(),
+            "anchor_old_center_norm_mean": center_norms.mean().item(),
+            "anchor_new_center_norm_mean": new_center_norms.mean().item(),
             "residual_to_raw_norm_ratio_mean": (
                 residual_norms / raw_update_norms.clamp_min(1e-12)
             )
@@ -211,6 +222,12 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             "residual_clipping_frequency": residual_clip_flags.mean().item(),
             "anchor_clipping_frequency": (
                 anchor_clip_flags.mean().item() if is_anchor_round else 0.0
+            ),
+            "anchor_old_center_clipping_frequency": (
+                anchor_clip_flags.mean().item() if is_anchor_round else 0.0
+            ),
+            "anchor_new_center_clipping_frequency": (
+                anchor_new_clip_flags.mean().item() if is_anchor_round else 0.0
             ),
             "dp_residual_clipped_norm_mean": clipped_residual_norms.mean().item(),
             "dp_residual_clipped_norm_max": clipped_residual_norms.max().item(),
