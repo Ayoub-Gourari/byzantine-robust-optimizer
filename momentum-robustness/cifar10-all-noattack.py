@@ -356,6 +356,8 @@ def initialize_worker(
             residual_alpha=args.residual_alpha,
             residual_center_mode=args.residual_center_mode,
             residual_center_beta=args.residual_center_beta,
+            momentum=MOMENTUM,
+            momentum_mode=args.momentum_mode,
             **worker_kwargs,
         )
 

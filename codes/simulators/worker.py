@@ -282,6 +282,8 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
         residual_alpha,
         residual_center_mode="ema",
         residual_center_beta=0.9,
+        momentum=0.0,
+        momentum_mode="ema",
         *args,
         **kwargs,
     ):
@@ -289,6 +291,10 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
         self.residual_clip_tau = residual_clip_tau
         self.residual_alpha = residual_alpha
         self.residual_center_beta = residual_center_beta
+        self.momentum = momentum
+        if momentum_mode not in ["classic", "ema"]:
+            raise ValueError(f"Unknown momentum_mode: {momentum_mode}.")
+        self.momentum_mode = momentum_mode
         normalized_mode = residual_center_mode.replace("-", "_")
         if normalized_mode not in ["ema", "clipped_residual_ema"]:
             raise ValueError(
@@ -302,6 +308,7 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
         self.residual_center_mode = normalized_mode
         self.private_center = None
         self.pending_private_center = None
+        self.local_momentum_buffer = None
         self.latest_diagnostics = {}
 
     def _clip(self, v):
@@ -318,8 +325,32 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
                 layer_gradients.append(p.grad.detach().view(-1))
         return torch.cat(layer_gradients)
 
+    def _get_effective_update(self, raw_gradient):
+        if self.momentum == 0:
+            return raw_gradient.detach(), 0.0
+
+        if self.local_momentum_buffer is None:
+            self.local_momentum_buffer = raw_gradient.detach().clone()
+            if self.momentum_mode == "ema":
+                self.local_momentum_buffer.mul_(1 - self.momentum)
+        else:
+            self.local_momentum_buffer.mul_(self.momentum)
+            if self.momentum_mode == "classic":
+                self.local_momentum_buffer.add_(raw_gradient.detach())
+            else:
+                self.local_momentum_buffer.add_(
+                    raw_gradient.detach(), alpha=1 - self.momentum
+                )
+        return self.local_momentum_buffer.detach().clone(), torch.norm(
+            self.local_momentum_buffer
+        ).item()
+
     def _save_grad(self) -> None:
-        raw_update = self._flatten_current_gradient()
+        stochastic_gradient = self._flatten_current_gradient()
+        raw_gradient_norm = torch.norm(stochastic_gradient).item()
+        raw_update, effective_update_norm = self._get_effective_update(
+            stochastic_gradient
+        )
         if self.private_center is None:
             self.private_center = torch.zeros_like(raw_update)
 
@@ -348,12 +379,21 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
             "client_center_old": center_before.detach(),
             "client_center_new": self.pending_private_center.detach(),
             "raw_update_norm": raw_update_norm,
+            "stochastic_grad_norm": raw_gradient_norm,
+            "effective_update_norm": effective_update_norm
+            if self.momentum != 0
+            else raw_update_norm,
             "residual_norm": residual_norm,
             "clipped_residual_norm": clipped_residual_norm,
             "residual_was_clipped": float(residual_norm > self.residual_clip_tau),
         }
         self.latest_diagnostics = {
             "raw_update_norm": raw_update_norm,
+            "stochastic_grad_norm": raw_gradient_norm,
+            "effective_update_norm": effective_update_norm
+            if self.momentum != 0
+            else raw_update_norm,
+            "momentum": self.momentum,
             "private_center_norm": center_norm,
             "next_private_center_norm": torch.norm(self.pending_private_center).item(),
             "old_center_norm": center_norm,
