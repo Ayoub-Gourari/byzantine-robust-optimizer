@@ -675,9 +675,8 @@ def print_privacy_table(rows, rounds_per_epoch, total_rounds):
     )
     header = [
         "method",
-        "anchor_period",
-        "rounds_res",
-        "rounds_anchor",
+        "T_residual",
+        "T_anchor",
         "C_res",
         "C_anchor",
         "sigma_res",
@@ -691,7 +690,6 @@ def print_privacy_table(rows, rounds_per_epoch, total_rounds):
     for row in rows:
         values = [
             row["method"],
-            row["anchor_period"],
             row["rounds_res"],
             row["rounds_anchor"],
             row["C_res"],
@@ -704,6 +702,26 @@ def print_privacy_table(rows, rounds_per_epoch, total_rounds):
             row["anchor_sensitivity"],
         ]
         print(" ".join(f"{format_privacy_value(value):>14}" for value in values))
+
+
+def assert_privacy_matches_target(rows, target_epsilon, target_delta, tolerance=1e-6):
+    if target_epsilon is None:
+        return
+
+    for row in rows:
+        epsilon = row["epsilon"]
+        delta = row["delta"]
+        if not np.isfinite(epsilon) or abs(epsilon - target_epsilon) > tolerance:
+            raise ValueError(
+                f"Privacy calibration mismatch for {row['method']}: "
+                f"epsilon={epsilon}, target_epsilon={target_epsilon}, "
+                f"tolerance={tolerance}."
+            )
+        if delta != target_delta:
+            raise ValueError(
+                f"Privacy calibration mismatch for {row['method']}: "
+                f"delta={delta}, target_delta={target_delta}."
+            )
 
 
 def privacy_metrics_from_mechanisms(
@@ -740,6 +758,7 @@ def run_privacy_dry_run():
     total_rounds = EPOCHS * rounds_per_epoch
     anchor_periods = parse_anchor_periods(args.privacy_report_anchor_periods)
     rows = build_privacy_rows(total_rounds, anchor_periods)
+    assert_privacy_matches_target(rows, args.target_epsilon, args.target_delta)
     print_privacy_table(rows, rounds_per_epoch, total_rounds)
 
 
@@ -781,13 +800,13 @@ def build_privacy_rows(total_rounds, anchor_periods):
                 total_rounds + anchor_releases,
             )
             residual_sigma = ardp_sigma
-            anchor_sigma = ardp_sigma
+            anchor_sigma = 0.0 if anchor_releases == 0 else ardp_sigma
         else:
             residual_sigma = args.dp_noise_multiplier
-            anchor_sigma = ANCHOR_NOISE_MULTIPLIER
+            anchor_sigma = 0.0 if anchor_releases == 0 else ANCHOR_NOISE_MULTIPLIER
         rows.append(
             privacy_row(
-                "ARDP",
+                f"ARDP K={anchor_period}",
                 total_rounds,
                 args.clip_tau,
                 ANCHOR_CLIP_TAU,
@@ -1150,10 +1169,12 @@ def main(args):
                 "dp-residual, and dp-residual-anchor."
             )
         calibration_rounds = total_rounds
+        anchor_rounds_for_calibration = 0
         if args.agg == "dp-residual-anchor":
-            calibration_rounds += count_anchor_rounds(
+            anchor_rounds_for_calibration = count_anchor_rounds(
                 total_rounds, args.anchor_period
             )
+            calibration_rounds += anchor_rounds_for_calibration
         computed_noise_multiplier = compute_full_participation_noise_multiplier(
             target_epsilon=args.target_epsilon,
             target_delta=args.target_delta,
@@ -1161,11 +1182,17 @@ def main(args):
         )
         if args.agg == "dp-residual-anchor":
             trainer.aggregator.residual_noise_multiplier = computed_noise_multiplier
-            trainer.aggregator.anchor_noise_multiplier = computed_noise_multiplier
+            trainer.aggregator.anchor_noise_multiplier = (
+                0.0 if anchor_rounds_for_calibration == 0 else computed_noise_multiplier
+            )
         else:
             trainer.aggregator.noise_multiplier = computed_noise_multiplier
         effective_residual_noise_multiplier = computed_noise_multiplier
-        effective_anchor_noise_multiplier = computed_noise_multiplier
+        effective_anchor_noise_multiplier = (
+            0.0
+            if args.agg == "dp-residual-anchor" and anchor_rounds_for_calibration == 0
+            else computed_noise_multiplier
+        )
     else:
         effective_residual_noise_multiplier = args.dp_noise_multiplier
         effective_anchor_noise_multiplier = ANCHOR_NOISE_MULTIPLIER
@@ -1178,6 +1205,18 @@ def main(args):
         mechanisms=accountant_mechanisms,
         target_delta=args.target_delta,
     )
+    if args.target_epsilon is not None:
+        assert_privacy_matches_target(
+            [
+                {
+                    "method": args.agg,
+                    "epsilon": effective_epsilon,
+                    "delta": args.target_delta,
+                }
+            ],
+            args.target_epsilon,
+            args.target_delta,
+        )
 
     trainer.accountant_summary = {
         "rounds_per_epoch": rounds_per_epoch,

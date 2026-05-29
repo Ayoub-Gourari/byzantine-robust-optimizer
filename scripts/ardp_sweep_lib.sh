@@ -10,7 +10,7 @@ SWEEP_SIZE="${SWEEP_SIZE:-small}"
 WANDB_ENABLED="${WANDB_ENABLED:-1}"
 WANDB_ENTITY="${WANDB_ENTITY:-ae-gourari-cole-polytechnique}"
 WANDB_PROJECT="${WANDB_PROJECT:-ARDP-FedAvg_VS_DP-FedAvg}"
-USE_CUDA_FLAG="${USE_CUDA_FLAG:---use-cuda}"
+USE_CUDA="${USE_CUDA:-1}"
 MODEL="${MODEL:-resnet20}"
 SEEDS=(${SEEDS:-0})
 EPOCHS="${EPOCHS:-70}"
@@ -20,6 +20,20 @@ TARGET_DELTA="${TARGET_DELTA:-2e-5}"
 TARGET_EPSILON="${TARGET_EPSILON:-8.0}"
 SIGMA="${SIGMA:-0.1}"
 ANCHOR_SIGMA="${ANCHOR_SIGMA:-$SIGMA}"
+
+CUDA_ARGS=()
+case "$USE_CUDA" in
+  1|true|TRUE|yes|YES)
+    CUDA_ARGS=(--use-cuda)
+    ;;
+  0|false|FALSE|no|NO)
+    CUDA_ARGS=()
+    ;;
+  *)
+    echo "Unknown USE_CUDA=$USE_CUDA. Use 1 or 0." >&2
+    exit 2
+    ;;
+esac
 
 case "$SWEEP_SIZE" in
   small)
@@ -131,8 +145,13 @@ run_ardp_grid() {
               log_file="${log_root}/${run_name}.out"
 
               local cmd=(
-                python3 momentum-robustness/cifar10-all-noattack.py
-                $USE_CUDA_FLAG
+                python3
+                momentum-robustness/cifar10-all-noattack.py
+              )
+              if [[ ${#CUDA_ARGS[@]} -gt 0 ]]; then
+                cmd+=("${CUDA_ARGS[@]}")
+              fi
+              cmd+=(
                 --model "$MODEL"
                 --agg dp-residual-anchor
                 --clip-tau "$effective_c_res"
