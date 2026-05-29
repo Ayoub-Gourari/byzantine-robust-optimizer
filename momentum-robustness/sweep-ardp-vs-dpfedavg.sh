@@ -26,7 +26,7 @@ RUN_FEDAVG_SWEEP="${RUN_FEDAVG_SWEEP:-0}"
 LR_SWEEP_FEDAVG_CLIPS=(${LR_SWEEP_FEDAVG_CLIPS:-1.6})
 LR_SWEEP_ARDP_CRES=(${LR_SWEEP_ARDP_CRES:-0.7})
 LR_SWEEP_ARDP_CANCHOR=(${LR_SWEEP_ARDP_CANCHOR:-1.5})
-LR_SWEEP_ARDP_ALPHAS=(${LR_SWEEP_ARDP_ALPHAS:-0.2})
+LR_SWEEP_ARDP_ALPHAS=(${LR_SWEEP_ARDP_ALPHAS:-1.0})
 LR_SWEEP_ARDP_PERIODS=(${LR_SWEEP_ARDP_PERIODS:-200})
 
 # Phase 2: refine after choosing BEST_LR from the phase-1 runs.
@@ -35,20 +35,20 @@ BEST_LR="${BEST_LR:-0.05}"
 REFINE_FEDAVG_CLIPS=(${REFINE_FEDAVG_CLIPS:-1.2 1.6 2.0})
 REFINE_ARDP_CRES=(${REFINE_ARDP_CRES:-0.6 0.7})
 REFINE_ARDP_CANCHOR=(${REFINE_ARDP_CANCHOR:-1.2 1.5})
-REFINE_ARDP_ALPHAS=(${REFINE_ARDP_ALPHAS:-0.2 0.3})
+REFINE_ARDP_ALPHAS=(${REFINE_ARDP_ALPHAS:-1.0})
 REFINE_ARDP_PERIODS=(${REFINE_ARDP_PERIODS:-100 200})
 
-# Keep the default ARDP center search minimal: tracker-style centers first.
+# ARDP now uses previous local momentum as the center, so alpha/beta are not tuned.
 RUN_EMA_CENTER="${RUN_EMA_CENTER:-0}"
-EMA_BETAS=(${EMA_BETAS:-0.8 0.7})
+EMA_BETAS=(${EMA_BETAS:-})
 
 # Full-grid mode: trimmed by default to the strongest practical candidates.
 FULL_GRID_FEDAVG_CLIPS=(${FULL_GRID_FEDAVG_CLIPS:-1.6})
 FULL_GRID_ARDP_CRES=(${FULL_GRID_ARDP_CRES:-0.55 0.7 0.8})
 FULL_GRID_ARDP_CANCHOR=(${FULL_GRID_ARDP_CANCHOR:-0.85 1.5 1.8})
-FULL_GRID_ARDP_ALPHAS=(${FULL_GRID_ARDP_ALPHAS:-0.2 0.3})
+FULL_GRID_ARDP_ALPHAS=(${FULL_GRID_ARDP_ALPHAS:-1.0})
 FULL_GRID_ARDP_PERIODS=(${FULL_GRID_ARDP_PERIODS:-100 200})
-FULL_GRID_EMA_BETAS=(${FULL_GRID_EMA_BETAS:-0.8 0.7})
+FULL_GRID_EMA_BETAS=(${FULL_GRID_EMA_BETAS:-})
 FULL_GRID_INCLUDE_EMA_CENTER="${FULL_GRID_INCLUDE_EMA_CENTER:-0}"
 
 COMMON_ARGS=(
@@ -91,13 +91,13 @@ run_ardp_clipres() {
   PYTHONPATH=. python3 momentum-robustness/cifar10-all-noattack.py \
     ${USE_CUDA_FLAG} \
     "${COMMON_ARGS[@]}" \
-    --wandb-run-name "${tag}-ardp-clipres-Cres${c_res}-Canchor${c_anchor}-alpha${alpha}-period${anchor_period}-lr${lr}-m${MOMENTUM}-mom${MOMENTUM_MODE}-sigma${NOISE_MULTIPLIER}-local${LOCAL_STEPS}-seed${seed}" \
+    --wandb-run-name "${tag}-ardp-prevmom-Cres${c_res}-Canchor${c_anchor}-period${anchor_period}-lr${lr}-m${MOMENTUM}-mom${MOMENTUM_MODE}-sigma${NOISE_MULTIPLIER}-local${LOCAL_STEPS}-seed${seed}" \
     --agg dp-residual-anchor \
     --clip-tau "$c_res" \
     --anchor-clip-tau "$c_anchor" \
     --dp-anchor-noise-multiplier "$ANCHOR_NOISE_MULTIPLIER" \
     --residual-center-mode clipped-residual-ema \
-    --residual-alpha "$alpha" \
+    --residual-alpha 1.0 \
     --anchor-period "$anchor_period" \
     --lr "$lr" \
     --seed "$seed"

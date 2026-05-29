@@ -274,7 +274,7 @@ class ResidualTrackingWorker(TorchWorker):
 
 
 class AnchorResetResidualTrackingWorker(TorchWorker):
-    """Client residual tracker that exposes old centers and stages center updates."""
+    """Client residual tracker centered at the previous effective local momentum."""
 
     def __init__(
         self,
@@ -289,7 +289,6 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
     ):
         super().__init__(*args, **kwargs)
         self.residual_clip_tau = residual_clip_tau
-        self.residual_alpha = residual_alpha
         self.residual_center_beta = residual_center_beta
         self.momentum = momentum
         if momentum_mode not in ["classic", "ema"]:
@@ -305,6 +304,7 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
             raise ValueError(
                 f"residual_center_beta must be in [0, 1]. Got {residual_center_beta}."
             )
+        self.residual_alpha = 1.0
         self.residual_center_mode = normalized_mode
         self.private_center = None
         self.pending_private_center = None
@@ -362,15 +362,7 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
         raw_update_norm = torch.norm(raw_update).item()
         center_norm = torch.norm(center_before).item()
 
-        if self.residual_center_mode == "ema":
-            next_private_center = (
-                self.residual_center_beta * center_before
-                + (1 - self.residual_center_beta) * raw_update.detach()
-            )
-        else:
-            next_private_center = (
-                center_before + self.residual_alpha * clipped_residual.detach()
-            )
+        next_private_center = raw_update.detach().clone()
         self.pending_private_center = next_private_center.detach()
 
         self.state["residual_tracking_anchor"]["payload"] = {
@@ -394,6 +386,7 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
             if self.momentum != 0
             else raw_update_norm,
             "momentum": self.momentum,
+            "effective_residual_alpha": 1.0,
             "private_center_norm": center_norm,
             "next_private_center_norm": torch.norm(self.pending_private_center).item(),
             "old_center_norm": center_norm,

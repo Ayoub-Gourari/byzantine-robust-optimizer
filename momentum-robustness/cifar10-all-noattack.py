@@ -225,6 +225,10 @@ ANCHOR_NOISE_MULTIPLIER = (
     if args.dp_anchor_noise_multiplier is not None
     else args.dp_noise_multiplier
 )
+ANCHOR_EFFECTIVE_ALPHA = 1.0 if args.agg == "dp-residual-anchor" else args.residual_alpha
+ANCHOR_CENTER_LABEL = (
+    "prevmom" if args.agg == "dp-residual-anchor" else args.residual_center_mode
+)
 DP_NOISE_LABEL = (
     f"eps{args.target_epsilon}-delta{args.target_delta}"
     if args.target_epsilon is not None
@@ -252,7 +256,7 @@ LOG_DIR = (
         f"_lr{args.lr}"
         f"_center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
         f"-scale{args.center_scale}"
-        f"_rcenter{args.residual_center_mode}-alpha{args.residual_alpha}"
+        f"_rcenter{ANCHOR_CENTER_LABEL}-alpha{ANCHOR_EFFECTIVE_ALPHA}"
         f"{ANCHOR_LABEL}"
         f"_{DP_NOISE_LABEL}"
         f"_local{args.local_steps}"
@@ -386,7 +390,7 @@ def maybe_init_wandb():
             f"-lr{args.lr}"
             f"-center{args.center_update}-{args.center_source}-beta{args.center_momentum}"
             f"-scale{args.center_scale}"
-            f"-rcenter{args.residual_center_mode}-alpha{args.residual_alpha}"
+            f"-rcenter{ANCHOR_CENTER_LABEL}-alpha{ANCHOR_EFFECTIVE_ALPHA}"
             f"{ANCHOR_LABEL}"
             f"-{DP_NOISE_LABEL}"
             f"-local{args.local_steps}"
@@ -412,8 +416,8 @@ def maybe_init_wandb():
             "center_source": args.center_source,
             "center_scale": args.center_scale,
             "per_client_center_momentum": args.per_client_center_momentum,
-            "residual_alpha": args.residual_alpha,
-            "residual_center_mode": args.residual_center_mode,
+            "residual_alpha": ANCHOR_EFFECTIVE_ALPHA,
+            "residual_center_mode": ANCHOR_CENTER_LABEL,
             "residual_center_beta": args.residual_center_beta,
             "dp_noise_multiplier": args.dp_noise_multiplier,
             "dp_anchor_noise_multiplier": ANCHOR_NOISE_MULTIPLIER,
@@ -531,7 +535,7 @@ def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):
     if args.agg == "dp-residual-anchor":
         anchor_releases = count_anchor_rounds(total_rounds, args.anchor_period)
         residual_sensitivity = full_participation_add_remove_sensitivity(
-            args.clip_tau, N_WORKERS, scale=args.residual_alpha
+            args.clip_tau, N_WORKERS
         )
         anchor_sensitivity = full_participation_add_remove_sensitivity(
             ANCHOR_CLIP_TAU, N_WORKERS

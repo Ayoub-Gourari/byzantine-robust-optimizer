@@ -74,7 +74,7 @@ class CentralDPResidualTracking(_BaseAggregator):
 
 
 class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
-    """Residual-tracking DP-FedAvg with periodic DP resets from client centers."""
+    """Residual-tracking DP-FedAvg with periodic DP resets from client momentum centers."""
 
     def __init__(
         self,
@@ -89,7 +89,7 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             raise ValueError(f"anchor_period must be >= 1. Got {anchor_period}.")
         self.residual_clip_tau = residual_clip_tau
         self.anchor_clip_tau = anchor_clip_tau
-        self.residual_alpha = residual_alpha
+        self.residual_alpha = 1.0
         self.residual_noise_multiplier = residual_noise_multiplier
         self.anchor_noise_multiplier = anchor_noise_multiplier
         self.anchor_period = anchor_period
@@ -164,7 +164,6 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
         residual_sensitivity = full_participation_add_remove_sensitivity(
             self.residual_clip_tau,
             n_clients,
-            scale=self.residual_alpha,
         )
         anchor_sensitivity = full_participation_add_remove_sensitivity(
             self.anchor_clip_tau,
@@ -177,7 +176,7 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             self.anchor_noise_multiplier, anchor_sensitivity
         )
         residual_noise = torch.randn_like(mean_clipped_residual) * residual_noise_std
-        noisy_delta = self.residual_alpha * mean_clipped_residual + residual_noise
+        noisy_delta = mean_clipped_residual + residual_noise
         residual_noise_norm = torch.norm(residual_noise).item()
         residual_noisy_delta_norm = torch.norm(noisy_delta).item()
         anchor_noise_norm = 0.0
@@ -206,7 +205,7 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             "C_anchor": self.anchor_clip_tau,
             "sigma_res": self.residual_noise_multiplier,
             "sigma_anchor": self.anchor_noise_multiplier,
-            "alpha": self.residual_alpha,
+            "alpha": 1.0,
             "anchor_period": self.anchor_period,
             "dp_residual_sensitivity": residual_sensitivity,
             "dp_anchor_sensitivity": anchor_sensitivity,
