@@ -327,34 +327,39 @@ class AnchorResetResidualTrackingWorker(TorchWorker):
 
     def _get_effective_update(self, raw_gradient):
         if self.momentum == 0:
-            return raw_gradient.detach(), 0.0
+            if self.private_center is None:
+                previous_update = torch.zeros_like(raw_gradient)
+            else:
+                previous_update = self.private_center.detach().clone()
+            current_update = raw_gradient.detach().clone()
+            return previous_update, current_update, torch.norm(current_update).item()
 
         if self.local_momentum_buffer is None:
-            self.local_momentum_buffer = raw_gradient.detach().clone()
+            previous_update = torch.zeros_like(raw_gradient)
+            current_update = raw_gradient.detach().clone()
             if self.momentum_mode == "ema":
-                self.local_momentum_buffer.mul_(1 - self.momentum)
+                current_update.mul_(1 - self.momentum)
         else:
-            self.local_momentum_buffer.mul_(self.momentum)
+            previous_update = self.local_momentum_buffer.detach().clone()
+            current_update = previous_update.mul(self.momentum)
             if self.momentum_mode == "classic":
-                self.local_momentum_buffer.add_(raw_gradient.detach())
+                current_update.add_(raw_gradient.detach())
             else:
-                self.local_momentum_buffer.add_(
-                    raw_gradient.detach(), alpha=1 - self.momentum
-                )
-        return self.local_momentum_buffer.detach().clone(), torch.norm(
-            self.local_momentum_buffer
-        ).item()
+                current_update.add_(raw_gradient.detach(), alpha=1 - self.momentum)
+
+        self.local_momentum_buffer = current_update.detach().clone()
+        return (
+            previous_update.detach().clone(),
+            current_update.detach().clone(),
+            torch.norm(current_update).item(),
+        )
 
     def _save_grad(self) -> None:
         stochastic_gradient = self._flatten_current_gradient()
         raw_gradient_norm = torch.norm(stochastic_gradient).item()
-        raw_update, effective_update_norm = self._get_effective_update(
+        center_before, raw_update, effective_update_norm = self._get_effective_update(
             stochastic_gradient
         )
-        if self.private_center is None:
-            self.private_center = torch.zeros_like(raw_update)
-
-        center_before = self.private_center
         residual = raw_update - center_before
         clipped_residual = self._clip(residual)
         clipped_residual_norm = torch.norm(clipped_residual).item()

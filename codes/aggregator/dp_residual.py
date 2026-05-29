@@ -85,8 +85,10 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
         anchor_noise_multiplier,
         anchor_period,
     ):
-        if anchor_period < 1:
-            raise ValueError(f"anchor_period must be >= 1. Got {anchor_period}.")
+        if anchor_period != -1 and anchor_period < 1:
+            raise ValueError(
+                f"anchor_period must be -1 or >= 1. Got {anchor_period}."
+            )
         self.residual_clip_tau = residual_clip_tau
         self.anchor_clip_tau = anchor_clip_tau
         self.residual_alpha = 1.0
@@ -159,7 +161,9 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
         # Round 0 has deterministic zero centers, so adding anchor noise there only
         # injects tracker noise without releasing data-dependent center information.
         is_anchor_round = (
-            self.round_index > 0 and self.round_index % self.anchor_period == 0
+            self.anchor_period != -1
+            and self.round_index > 0
+            and self.round_index % self.anchor_period == 0
         )
         residual_sensitivity = full_participation_add_remove_sensitivity(
             self.residual_clip_tau,
@@ -198,6 +202,14 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             anchor_clipped_norms = torch.zeros_like(center_norms)
             anchor_norm = 0.0
 
+        mean_new_center = new_client_centers.mean(dim=0)
+        tracker_error = torch.norm(self.public_tracker - mean_new_center).item()
+        relative_tracker_error = tracker_error / (
+            torch.norm(mean_new_center).item() + 1e-12
+        )
+        residual_clip_fraction = residual_clip_flags.mean().item()
+        anchor_clip_fraction = anchor_clip_flags.mean().item() if is_anchor_round else 0.0
+
         self.latest_diagnostics = {
             "round_index": self.round_index,
             "is_anchor_round": float(is_anchor_round),
@@ -207,6 +219,7 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             "sigma_anchor": self.anchor_noise_multiplier,
             "alpha": 1.0,
             "anchor_period": self.anchor_period,
+            "anchors_enabled": float(self.anchor_period != -1),
             "dp_residual_sensitivity": residual_sensitivity,
             "dp_anchor_sensitivity": anchor_sensitivity,
             "dp_anchor_from_preupdate_centers": 1.0 if is_anchor_round else 0.0,
@@ -222,10 +235,8 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             )
             .mean()
             .item(),
-            "residual_clipping_frequency": residual_clip_flags.mean().item(),
-            "anchor_clipping_frequency": (
-                anchor_clip_flags.mean().item() if is_anchor_round else 0.0
-            ),
+            "residual_clipping_frequency": residual_clip_fraction,
+            "anchor_clipping_frequency": anchor_clip_fraction,
             "anchor_old_center_clipping_frequency": (
                 anchor_clip_flags.mean().item() if is_anchor_round else 0.0
             ),
@@ -245,6 +256,14 @@ class ResidualTrackingDPFedAvgWithAnchorResets(_BaseAggregator):
             "dp_anchor_noise_norm": anchor_noise_norm,
             "dp_anchor_norm": anchor_norm,
             "dp_public_tracker_norm": torch.norm(self.public_tracker).item(),
+            "ardp/residual_raw_norm_mean": residual_norms.mean().item(),
+            "ardp/residual_clipped_norm_mean": clipped_residual_norms.mean().item(),
+            "ardp/residual_clip_fraction": residual_clip_fraction,
+            "ardp/anchor_raw_norm_mean": center_norms.mean().item(),
+            "ardp/anchor_clip_fraction": anchor_clip_fraction,
+            "ardp/tracker_norm": torch.norm(self.public_tracker).item(),
+            "ardp/tracker_error": tracker_error,
+            "ardp/relative_tracker_error": relative_tracker_error,
         }
         self.round_index += 1
 

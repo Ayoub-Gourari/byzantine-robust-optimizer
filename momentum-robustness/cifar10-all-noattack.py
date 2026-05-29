@@ -49,6 +49,12 @@ parser.add_argument("--debug", action="store_true", default=False)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--log_interval", type=int, default=10)
 parser.add_argument("--lr", type=float, default=0.1, help="Server/client learning rate.")
+parser.add_argument(
+    "--epochs",
+    type=int,
+    default=70,
+    help="Number of training epochs.",
+)
 
 parser.add_argument("--attack", type=str, default="NA", help="Select from BF and LF.")
 parser.add_argument(
@@ -173,7 +179,10 @@ parser.add_argument(
     "--anchor-period",
     type=int,
     default=100,
-    help="Reset server center every anchor_period rounds for dp-residual-anchor.",
+    help=(
+        "Reset server center every anchor_period rounds for dp-residual-anchor. "
+        "Use -1 to disable anchor resets."
+    ),
 )
 parser.add_argument(
     "--target-epsilon",
@@ -186,6 +195,27 @@ parser.add_argument(
     type=float,
     default=1e-5,
     help="Target delta for the full-participation central-DP accountant.",
+)
+parser.add_argument(
+    "--privacy-dry-run",
+    action="store_true",
+    default=False,
+    help="Print the DP privacy table and exit before model/data/training setup.",
+)
+parser.add_argument(
+    "--privacy-report-anchor-periods",
+    type=str,
+    default="10,20,50,-1",
+    help="Comma-separated anchor periods for --privacy-dry-run comparison rows.",
+)
+parser.add_argument(
+    "--privacy-report-fedavg-clip-tau",
+    type=float,
+    default=None,
+    help=(
+        "DP-FedAvg clipping radius used in --privacy-dry-run tables. Defaults "
+        "to --clip-tau."
+    ),
 )
 parser.add_argument("--wandb", action="store_true", default=False)
 parser.add_argument(
@@ -215,7 +245,7 @@ N_BYZ = 0
 BATCH_SIZE = 32
 TEST_BATCH_SIZE = 128
 MAX_BATCHES_PER_EPOCH = 9999999
-EPOCHS = 70
+EPOCHS = args.epochs
 MOMENTUM = args.momentum
 ANCHOR_CLIP_TAU = (
     args.anchor_clip_tau if args.anchor_clip_tau is not None else args.clip_tau
@@ -436,6 +466,8 @@ def maybe_init_wandb():
     )
     wandb.define_metric("train/global_step")
     wandb.define_metric("train/*", step_metric="train/global_step")
+    wandb.define_metric("ardp/*", step_metric="train/global_step")
+    wandb.define_metric("privacy/*", step_metric="train/global_step")
     wandb.define_metric("validation/*", step_metric="train/global_step")
     return run
 
@@ -495,28 +527,289 @@ def compute_full_participation_epsilon(noise_multiplier, target_delta, total_rou
     )
 
 
+def estimate_rounds_per_epoch(dataset_size=50000):
+    samples_per_worker = int(np.ceil(dataset_size * 1.0 / N_WORKERS))
+    return samples_per_worker // BATCH_SIZE
+
+
+def parse_anchor_periods(value):
+    periods = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        periods.append(int(item))
+    if not periods:
+        raise ValueError("At least one anchor period is required.")
+    return periods
+
+
 def count_anchor_rounds(total_rounds, anchor_period):
+    if anchor_period == -1:
+        return 0
     if anchor_period < 1:
-        raise ValueError(f"anchor_period must be >= 1. Got {anchor_period}.")
+        raise ValueError(f"anchor_period must be -1 or >= 1. Got {anchor_period}.")
     if total_rounds <= 1:
         return 0
     return (total_rounds - 1) // anchor_period
 
 
+def dp_fedavg_mechanisms(total_rounds, clip_tau, noise_multiplier):
+    sensitivity = full_participation_add_remove_sensitivity(clip_tau, N_WORKERS)
+    return [
+        {
+            "name": "dp_fedavg",
+            "releases": total_rounds,
+            "sensitivity": sensitivity,
+            "noise_multiplier": noise_multiplier,
+            "noise_std": gaussian_noise_std(noise_multiplier, sensitivity),
+        }
+    ]
+
+
+def ardp_mechanisms(
+    total_rounds,
+    c_res,
+    c_anchor,
+    anchor_period,
+    residual_sigma,
+    anchor_sigma,
+):
+    anchor_releases = count_anchor_rounds(total_rounds, anchor_period)
+    residual_sensitivity = full_participation_add_remove_sensitivity(
+        c_res, N_WORKERS
+    )
+    anchor_sensitivity = (
+        0.0
+        if anchor_releases == 0
+        else full_participation_add_remove_sensitivity(c_anchor, N_WORKERS)
+    )
+    return [
+        {
+            "name": "residual",
+            "releases": total_rounds,
+            "sensitivity": residual_sensitivity,
+            "noise_multiplier": residual_sigma,
+            "noise_std": gaussian_noise_std(residual_sigma, residual_sensitivity),
+        },
+        {
+            "name": "anchor",
+            "releases": anchor_releases,
+            "sensitivity": anchor_sensitivity,
+            "noise_multiplier": anchor_sigma,
+            "noise_std": (
+                0.0
+                if anchor_releases == 0
+                else gaussian_noise_std(anchor_sigma, anchor_sensitivity)
+            ),
+        },
+    ]
+
+
+def common_sigma_for_mechanisms(target_epsilon, target_delta, release_count):
+    return compute_full_participation_noise_multiplier(
+        target_epsilon=target_epsilon,
+        target_delta=target_delta,
+        total_rounds=release_count,
+    )
+
+
+def privacy_row(
+    method,
+    total_rounds,
+    c_res,
+    c_anchor,
+    anchor_period,
+    residual_sigma,
+    anchor_sigma,
+    mechanisms,
+):
+    epsilon = compute_composed_full_participation_epsilon(
+        mechanisms=mechanisms,
+        target_delta=args.target_delta,
+    )
+    residual_rounds = mechanisms[0]["releases"] if mechanisms else 0
+    anchor_rounds = (
+        next((m["releases"] for m in mechanisms if m["name"] == "anchor"), 0)
+        if mechanisms
+        else 0
+    )
+    residual_sensitivity = mechanisms[0]["sensitivity"] if mechanisms else 0.0
+    anchor_sensitivity = (
+        next((m["sensitivity"] for m in mechanisms if m["name"] == "anchor"), 0.0)
+        if mechanisms
+        else 0.0
+    )
+    return {
+        "method": method,
+        "rounds_res": residual_rounds,
+        "rounds_anchor": anchor_rounds,
+        "C_res": c_res,
+        "C_anchor": c_anchor,
+        "sigma_res": residual_sigma,
+        "sigma_anchor": anchor_sigma,
+        "epsilon": epsilon,
+        "delta": args.target_delta,
+        "residual_sensitivity": residual_sensitivity,
+        "anchor_sensitivity": anchor_sensitivity,
+        "anchor_period": anchor_period,
+        "total_rounds": total_rounds,
+    }
+
+
+def format_privacy_value(value):
+    if value is None:
+        return "-"
+    if isinstance(value, str):
+        return value
+    if value == float("inf"):
+        return "inf"
+    return f"{value:.6g}"
+
+
+def print_privacy_table(rows, rounds_per_epoch, total_rounds):
+    print(
+        "Privacy dry run:"
+        f" rounds_per_epoch={rounds_per_epoch}, total_rounds={total_rounds},"
+        f" epochs={EPOCHS}, N={N_WORKERS}, delta={args.target_delta}"
+    )
+    header = [
+        "method",
+        "anchor_period",
+        "rounds_res",
+        "rounds_anchor",
+        "C_res",
+        "C_anchor",
+        "sigma_res",
+        "sigma_anchor",
+        "epsilon",
+        "delta",
+        "res_sens",
+        "anchor_sens",
+    ]
+    print(" ".join(f"{item:>14}" for item in header))
+    for row in rows:
+        values = [
+            row["method"],
+            row["anchor_period"],
+            row["rounds_res"],
+            row["rounds_anchor"],
+            row["C_res"],
+            row["C_anchor"],
+            row["sigma_res"],
+            row["sigma_anchor"],
+            row["epsilon"],
+            row["delta"],
+            row["residual_sensitivity"],
+            row["anchor_sensitivity"],
+        ]
+        print(" ".join(f"{format_privacy_value(value):>14}" for value in values))
+
+
+def privacy_metrics_from_mechanisms(
+    mechanisms,
+    epsilon,
+    target_epsilon,
+    target_delta,
+    c_res,
+    c_anchor,
+    sigma_res,
+    sigma_anchor,
+):
+    residual = mechanisms[0] if mechanisms else {}
+    anchor = next((m for m in mechanisms if m["name"] == "anchor"), {})
+    return {
+        "privacy/target_epsilon": (
+            float("nan") if target_epsilon is None else target_epsilon
+        ),
+        "privacy/epsilon": epsilon,
+        "privacy/delta": target_delta,
+        "privacy/residual_rounds": residual.get("releases", 0),
+        "privacy/anchor_rounds": anchor.get("releases", 0),
+        "privacy/sigma_res": sigma_res,
+        "privacy/sigma_anchor": sigma_anchor,
+        "privacy/C_res": c_res,
+        "privacy/C_anchor": 0.0 if c_anchor is None else c_anchor,
+        "privacy/residual_sensitivity": residual.get("sensitivity", 0.0),
+        "privacy/anchor_sensitivity": anchor.get("sensitivity", 0.0),
+    }
+
+
+def run_privacy_dry_run():
+    rounds_per_epoch = estimate_rounds_per_epoch()
+    total_rounds = EPOCHS * rounds_per_epoch
+    anchor_periods = parse_anchor_periods(args.privacy_report_anchor_periods)
+    rows = build_privacy_rows(total_rounds, anchor_periods)
+    print_privacy_table(rows, rounds_per_epoch, total_rounds)
+
+
+def build_privacy_rows(total_rounds, anchor_periods):
+    fedavg_clip_tau = (
+        args.privacy_report_fedavg_clip_tau
+        if args.privacy_report_fedavg_clip_tau is not None
+        else args.clip_tau
+    )
+    rows = []
+
+    if args.target_epsilon is not None:
+        fedavg_sigma = common_sigma_for_mechanisms(
+            args.target_epsilon,
+            args.target_delta,
+            total_rounds,
+        )
+    else:
+        fedavg_sigma = args.dp_noise_multiplier
+    rows.append(
+        privacy_row(
+            "DP-FedAvg",
+            total_rounds,
+            fedavg_clip_tau,
+            None,
+            "-",
+            fedavg_sigma,
+            None,
+            dp_fedavg_mechanisms(total_rounds, fedavg_clip_tau, fedavg_sigma),
+        )
+    )
+
+    for anchor_period in anchor_periods:
+        anchor_releases = count_anchor_rounds(total_rounds, anchor_period)
+        if args.target_epsilon is not None:
+            ardp_sigma = common_sigma_for_mechanisms(
+                args.target_epsilon,
+                args.target_delta,
+                total_rounds + anchor_releases,
+            )
+            residual_sigma = ardp_sigma
+            anchor_sigma = ardp_sigma
+        else:
+            residual_sigma = args.dp_noise_multiplier
+            anchor_sigma = ANCHOR_NOISE_MULTIPLIER
+        rows.append(
+            privacy_row(
+                "ARDP",
+                total_rounds,
+                args.clip_tau,
+                ANCHOR_CLIP_TAU,
+                anchor_period,
+                residual_sigma,
+                anchor_sigma,
+                ardp_mechanisms(
+                    total_rounds,
+                    args.clip_tau,
+                    ANCHOR_CLIP_TAU,
+                    anchor_period,
+                    residual_sigma,
+                    anchor_sigma,
+                ),
+            )
+        )
+    return rows
+
+
 def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):
     if args.agg == "dp-fedavg":
-        sensitivity = full_participation_add_remove_sensitivity(
-            args.clip_tau, N_WORKERS
-        )
-        return [
-            {
-                "name": "dp_fedavg",
-                "releases": total_rounds,
-                "sensitivity": sensitivity,
-                "noise_multiplier": residual_sigma,
-                "noise_std": gaussian_noise_std(residual_sigma, sensitivity),
-            }
-        ]
+        return dp_fedavg_mechanisms(total_rounds, args.clip_tau, residual_sigma)
 
     if args.agg == "dp-residual":
         sensitivity = full_participation_add_remove_sensitivity(
@@ -533,31 +826,14 @@ def get_dp_accountant_mechanisms(total_rounds, residual_sigma, anchor_sigma):
         ]
 
     if args.agg == "dp-residual-anchor":
-        anchor_releases = count_anchor_rounds(total_rounds, args.anchor_period)
-        residual_sensitivity = full_participation_add_remove_sensitivity(
-            args.clip_tau, N_WORKERS
+        return ardp_mechanisms(
+            total_rounds,
+            args.clip_tau,
+            ANCHOR_CLIP_TAU,
+            args.anchor_period,
+            residual_sigma,
+            anchor_sigma,
         )
-        anchor_sensitivity = full_participation_add_remove_sensitivity(
-            ANCHOR_CLIP_TAU, N_WORKERS
-        )
-        return [
-            {
-                "name": "residual",
-                "releases": total_rounds,
-                "sensitivity": residual_sensitivity,
-                "noise_multiplier": residual_sigma,
-                "noise_std": gaussian_noise_std(
-                    residual_sigma, residual_sensitivity
-                ),
-            },
-            {
-                "name": "anchor",
-                "releases": anchor_releases,
-                "sensitivity": anchor_sensitivity,
-                "noise_multiplier": anchor_sigma,
-                "noise_std": gaussian_noise_std(anchor_sigma, anchor_sensitivity),
-            },
-        ]
 
     return []
 
@@ -684,6 +960,13 @@ def make_wandb_post_batch_hook():
         }
         if diagnostics:
             payload.update({f"train/{key}": value for key, value in diagnostics.items()})
+            payload.update(
+                {
+                    key: value
+                    for key, value in diagnostics.items()
+                    if key.startswith("ardp/")
+                }
+            )
         if per_client_diagnostics:
             payload.update(
                 {
@@ -922,6 +1205,16 @@ def main(args):
         f" mechanisms=[{mechanism_summary}],"
         f" epsilon={effective_epsilon:.6f}, target_delta={args.target_delta}"
     )
+    privacy_payload = privacy_metrics_from_mechanisms(
+        mechanisms=accountant_mechanisms,
+        epsilon=effective_epsilon,
+        target_epsilon=args.target_epsilon,
+        target_delta=args.target_delta,
+        c_res=args.clip_tau,
+        c_anchor=ANCHOR_CLIP_TAU if args.agg == "dp-residual-anchor" else None,
+        sigma_res=effective_residual_noise_multiplier,
+        sigma_anchor=effective_anchor_noise_multiplier,
+    )
     if args.wandb and wandb.run is not None:
         wandb.config.update(
             {
@@ -934,9 +1227,11 @@ def main(args):
                 "dp_anchor_noise_multiplier": effective_anchor_noise_multiplier,
                 "effective_epsilon": effective_epsilon,
                 "dp_accountant_mechanisms": accountant_mechanisms,
+                **privacy_payload,
             },
             allow_val_change=True,
         )
+        wandb.log(privacy_payload, step=0)
 
     initial_eval_log = evaluator.evaluate(0)
     if args.wandb:
@@ -957,4 +1252,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    main(args)
+    if args.privacy_dry_run:
+        run_privacy_dry_run()
+    else:
+        main(args)
