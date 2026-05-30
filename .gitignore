@@ -130,6 +130,7 @@ dmypy.json
 .pyre/
 
 # Experiment artifacts
+datasets/
 logs/
 outputs/
 wandb/
