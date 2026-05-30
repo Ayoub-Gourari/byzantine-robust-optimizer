@@ -194,6 +194,19 @@ class MomentumClipper:
             clipped_grad, _, scale = clip_by_global_norm(grads, self.clip_c)
             data.update(
                 {
+                    "clip_input_norm": grad_norm,
+                    "clipped_object_norm": tensor_list_global_norm(
+                        clipped_grad
+                    ).item(),
+                    "clip_threshold": self.clip_c,
+                    "clip_active": float(grad_norm > self.clip_c),
+                    "clip_fraction": scale,
+                    "standard_clip_threshold": self.clip_c,
+                    "standard_clip_input_norm": grad_norm,
+                    "standard_clipped_grad_norm": tensor_list_global_norm(
+                        clipped_grad
+                    ).item(),
+                    "standard_clip_active": float(grad_norm > self.clip_c),
                     "standard_clip_fraction": scale,
                     "standard_clipping_error_norm": tensor_list_global_norm(
                         tensor_list_sub(clipped_grad, grads)
@@ -209,8 +222,22 @@ class MomentumClipper:
             clipped_residuals, _, scale = clip_by_global_norm(
                 residuals, self.clip_c_res
             )
+            residual_norm = data["residual_norm"]
             data.update(
                 {
+                    "clip_input_norm": residual_norm,
+                    "clipped_object_norm": tensor_list_global_norm(
+                        clipped_residuals
+                    ).item(),
+                    "clip_threshold": self.clip_c_res,
+                    "clip_active": float(residual_norm > self.clip_c_res),
+                    "clip_fraction": scale,
+                    "residual_clip_threshold": self.clip_c_res,
+                    "residual_clip_input_norm": residual_norm,
+                    "residual_clipped_residual_norm": tensor_list_global_norm(
+                        clipped_residuals
+                    ).item(),
+                    "residual_clip_active": float(residual_norm > self.clip_c_res),
                     "residual_clip_fraction": scale,
                     "residual_clipping_error_norm": clipping_error_norm(
                         momentum_before, clipped_residuals, grads
@@ -296,11 +323,30 @@ def write_jsonl(handle, payload):
     handle.flush()
 
 
+def wandb_payload_from(payload):
+    allowed = {
+        "train/loss",
+        "train/accuracy",
+        "train/clip_input_norm",
+        "train/clip_active_percent",
+        "validation/loss",
+        "validation/accuracy",
+    }
+    filtered = {key: value for key, value in payload.items() if key in allowed}
+    if "train/clip_active" in payload:
+        filtered["train/clip_active_percent"] = 100.0 * payload["train/clip_active"]
+    elif "train/loss" in payload:
+        filtered["train/clip_active_percent"] = 0.0
+    return filtered
+
+
 def log_payload(args, payload, metrics_file):
     write_jsonl(metrics_file, payload)
     if args.wandb and wandb is not None and wandb.run is not None:
         step = payload.get("train/global_step", payload.get("validation/global_step"))
-        wandb.log(payload, step=step)
+        wandb_payload = wandb_payload_from(payload)
+        if wandb_payload:
+            wandb.log(wandb_payload, step=step)
 
 
 def train_one_epoch(
@@ -521,8 +567,6 @@ def main():
         "diagnostics": tracker.summarize(),
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    if args.wandb and wandb is not None and wandb.run is not None:
-        wandb.run.summary.update(summary)
     if run is not None:
         run.finish()
 
