@@ -325,15 +325,21 @@ def write_jsonl(handle, payload):
 
 def wandb_payload_from(payload):
     allowed = {
+        "train/global_step",
+        "train/epoch",
         "train/loss",
         "train/accuracy",
         "train/clip_input_norm",
         "train/clip_active_percent",
+        "validation/global_step",
+        "validation/epoch",
         "validation/loss",
         "validation/accuracy",
     }
     filtered = {key: value for key, value in payload.items() if key in allowed}
-    if "train/clip_active" in payload:
+    if "train/clip_active_percent" in payload:
+        filtered["train/clip_active_percent"] = payload["train/clip_active_percent"]
+    elif "train/clip_active" in payload:
         filtered["train/clip_active_percent"] = 100.0 * payload["train/clip_active"]
     elif "train/loss" in payload:
         filtered["train/clip_active_percent"] = 0.0
@@ -361,6 +367,7 @@ def train_one_epoch(
     global_step,
     metrics_file,
     tracker,
+    clip_stats,
 ):
     model.train()
     params = optimizer.params
@@ -379,6 +386,9 @@ def train_one_epoch(
         diagnostics = optimizer.step(grads, lr)
         diagnostics["data_grad_norm"] = tensor_list_global_norm(data_grads).item()
         tracker.update(diagnostics)
+        if "clip_active" in diagnostics:
+            clip_stats["total"] += 1
+            clip_stats["active"] += diagnostics["clip_active"]
 
         global_step += 1
         if batch_idx % args.log_interval == 0:
@@ -391,6 +401,10 @@ def train_one_epoch(
                 "train/lr": lr,
             }
             payload.update({f"train/{key}": value for key, value in diagnostics.items()})
+            if clip_stats["total"] > 0:
+                payload["train/clip_active_percent"] = (
+                    100.0 * clip_stats["active"] / clip_stats["total"]
+                )
             log_payload(args, payload, metrics_file)
             print(
                 " ".join(
@@ -497,6 +511,7 @@ def main():
         clip_c_res=args.clip_c_res,
     )
     tracker = RunningDiagnostics()
+    clip_stats = {"active": 0.0, "total": 0}
     global_step = 0
     best_accuracy = 0.0
     best_epoch = 0
@@ -528,6 +543,7 @@ def main():
                 global_step=global_step,
                 metrics_file=metrics_file,
                 tracker=tracker,
+                clip_stats=clip_stats,
             )
             eval_log = evaluate(args, model, test_loader, loss_func, device)
             if eval_log["accuracy"] > best_accuracy:
